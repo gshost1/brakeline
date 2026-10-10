@@ -1,0 +1,31 @@
+[package]
+name = "brakeline"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A fast local guard for coding agents: stops loops and runaway spend, blocks catastrophic commands, and snapshots work before destructive shell commands"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/gshost1/brakeline"
+keywords = ["ai-agents", "claude-code", "hooks", "guardrails", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "brakeline"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

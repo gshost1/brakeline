@@ -1,0 +1,66 @@
+# brakeline user config: ~/.config/brakeline/config.toml (or $BRAKELINE_CONFIG).
+# Every field is optional; these are the defaults.
+# A project may add .brakeline.toml with the same sections (except [[pricing]]),
+# but it can only make limits stricter.
+
+[loops]
+# Identical calls (same tool and input) allowed with no file edit in between.
+max_identical_calls = 5
+# How many recent calls are remembered for that check.
+window = 40
+# The same call failing this many times in a row, with no edit in between, is refused.
+max_consecutive_failures = 3
+# The same call failing this many times in a session is refused, edits or not.
+max_total_failures_per_call = 12
+# This many refusals in a row stops the whole run until `brakeline reset`.
+max_denials_before_stop = 3
+# Successful use of these tools counts as progress and resets loop counters.
+# (Claude Code: Edit/Write/MultiEdit/NotebookEdit; Droid: Edit/Create/ApplyPatch.)
+progress_tools = ["Edit", "Write", "MultiEdit", "NotebookEdit", "Create", "ApplyPatch"]
+
+[budget]
+# Per session. Set a value to 0 to disable that budget.
+max_tool_calls = 800
+max_session_minutes = 480
+max_cost_usd = 50.0
+# max_output_tokens = 2000000
+# Droid only: Factory credits reported for the session, subagents included.
+# max_factory_credits = 5000000
+
+[shell]
+block_catastrophic = true
+block_force_push = true
+snapshot_before_destructive = true
+# Extra case-insensitive substrings that are always refused.
+blocked_substrings = []
+# blocked_substrings = ["terraform destroy", "kubectl delete namespace", "DROP DATABASE"]
+
+# USD per million tokens, used for the cost estimate. First match on the
+# model name wins; "" is the fallback. Verify against your provider's prices.
+[[pricing]]
+model_contains = "opus"
+input = 5.0
+output = 25.0
+cache_write = 6.25
+cache_read = 0.5
+
+[[pricing]]
+model_contains = "sonnet"
+input = 3.0
+output = 15.0
+cache_write = 3.75
+cache_read = 0.3
+
+[[pricing]]
+model_contains = "haiku"
+input = 1.0
+output = 5.0
+cache_write = 1.25
+cache_read = 0.1
+
+[[pricing]]
+model_contains = ""
+input = 3.0
+output = 15.0
+cache_write = 3.75
+cache_read = 0.3
