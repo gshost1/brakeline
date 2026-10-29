@@ -1,5 +1,9 @@
 # brakeline
 
+**At a glance:** a Rust command-line tool (about 3,900 lines, 53 tests, MIT) that stops coding agents from looping, overspending or wiping out your work. It runs on every tool call in about 6 ms, supports Claude Code and Factory Droid, and works by reading the agent's hook events and its transcript.
+
+**Skills shown:** systems programming in Rust, shell-command parsing, git internals (snapshots stored as git objects without touching your index), file locking and concurrent state, security design (an untrusted repo can only tighten limits, never loosen them), and end-to-end testing against real agents.
+
 **A seatbelt for unattended coding agents.** brakeline is a single native binary that sits in your agent's hook pipeline and does four things on every tool call, in about 6 ms:
 
 1. **Stops loops.** If the agent repeats the same call with no file changes in between, or retries a failing command again and again, the call is refused with an explanation the agent can act on. If it keeps getting refused, the run is stopped.
@@ -13,7 +17,7 @@
 - Agents get stuck. One public report describes Codex looping for 9 hours and using up a week of quota while redoing finished work.
 - Built-in undo does not cover the shell. Claude Code checkpoints do not track files changed by `rm`, `mv` or other Bash commands. In one reported incident, an agent ran `git restore` on a repository with three days of uncommitted work, and git had nothing left to recover.
 
-Existing tools each cover one slice: Python loop hooks, phone kill switches, or edit-only checkpoints. brakeline puts all four protections in one dependency-free binary that is fast enough to run on every call.
+Existing tools each cover one slice: Python loop hooks, phone kill switches, or edit-only checkpoints. brakeline puts all four protections in one binary with no runtime dependencies that is fast enough to run on every call.
 
 ## Install
 
