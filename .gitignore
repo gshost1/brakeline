@@ -1,3 +1,7 @@
 target/
 *.brakeline-backup
 .DS_Store
+.env
+.env.*
+*.key
+*.pem
