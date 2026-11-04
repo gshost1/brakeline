@@ -216,6 +216,32 @@ fn fs_path(root: &Path, rel: &[u8]) -> PathBuf {
     }
 }
 
+/// Whether `rel`, a path read from a nested repository (whose index may be
+/// hand-crafted), names something inside `dir`: relative, with no empty,
+/// `.` or `..` component, and no symbolic link among its leading components
+/// on disk. Git refuses to add such paths itself, but only after it has
+/// read through them.
+fn safe_rel(dir: &Path, rel: &[u8]) -> bool {
+    if rel.is_empty() || rel.starts_with(b"/") {
+        return false;
+    }
+    let parts: Vec<&[u8]> = rel.split(|b| *b == b'/').collect();
+    if parts.iter().any(|p| {
+        p.is_empty() || *p == b"." || *p == b".." || (cfg!(not(unix)) && p.contains(&b'\\'))
+    }) {
+        return false;
+    }
+    let mut at = dir.to_path_buf();
+    for part in &parts[..parts.len() - 1] {
+        at = fs_path(&at, part);
+        // A missing component is fine: nothing will be found under it.
+        if fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Index entries flagged skip-worktree and assume-unchanged, from
 /// `git ls-files -v`: `S`/`s` mark skip-worktree, lowercase marks
 /// assume-unchanged.
@@ -298,6 +324,9 @@ struct Uncovered {
     /// Directory path relative to the repository root, without a trailing slash.
     path: String,
     reason: String,
+    /// Nothing under `path` was stored. False when only some entries of the
+    /// nested repository at `path` were left out.
+    whole: bool,
 }
 
 impl std::fmt::Display for Uncovered {
@@ -450,6 +479,7 @@ impl Walker<'_> {
             self.uncovered.push(Uncovered {
                 path: name,
                 reason: format!("{err:#}"),
+                whole: true,
             });
         }
     }
@@ -462,6 +492,7 @@ impl Walker<'_> {
         if depth >= MAX_NESTED_DEPTH {
             bail!("nested git repositories go too deep");
         }
+        self.check_inside(dir)?;
         let found = self.nested_files(dir, name)?;
         let (repos, files): (Vec<Found>, Vec<Found>) = found.into_iter().partition(|f| f.repo);
         let bytes: u64 = files.iter().map(|f| f.len).sum();
@@ -509,8 +540,35 @@ impl Walker<'_> {
         )?))
     }
 
-    /// What [`nested_tree`] stores for the repository at `dir`.
-    fn nested_files(&self, dir: &Path, name: &str) -> Result<Vec<Found>> {
+    /// Fails unless `dir` is inside the outer work tree with no symbolic
+    /// link on the way, so git is never pointed at a work tree elsewhere.
+    fn check_inside(&self, dir: &Path) -> Result<()> {
+        let rel = dir
+            .strip_prefix(self.root)
+            .ok()
+            .filter(|rel| !rel.as_os_str().is_empty())
+            .context("unsafe path: outside the repository")?;
+        let mut at = self.root.to_path_buf();
+        for part in rel.components() {
+            let std::path::Component::Normal(part) = part else {
+                bail!("unsafe path: outside the repository");
+            };
+            at.push(part);
+            let meta = fs::symlink_metadata(&at).context("unsafe path")?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                bail!("unsafe path: through a symbolic link");
+            }
+        }
+        let (root, dir) = (fs::canonicalize(self.root)?, fs::canonicalize(dir)?);
+        if dir == root || !dir.starts_with(&root) {
+            bail!("unsafe path: outside the repository");
+        }
+        Ok(())
+    }
+
+    /// What [`nested_tree`] stores for the repository at `dir`. Entries
+    /// that would reach outside it are left out and recorded.
+    fn nested_files(&mut self, dir: &Path, name: &str) -> Result<Vec<Found>> {
         let own = nested_git_dir(dir);
         // Its index is only read (optional locks are off); a missing one
         // reads as empty.
@@ -541,7 +599,24 @@ impl Walker<'_> {
                 continue;
             };
             let tracked = tag != b'?';
+            let rel = path.strip_suffix(b"/").unwrap_or(path);
+            if !safe_rel(dir, rel) {
+                self.uncovered.push(Uncovered {
+                    path: name.to_string(),
+                    reason: format!(
+                        "unsafe path {:?} in its index left out",
+                        String::from_utf8_lossy(path)
+                    ),
+                    whole: false,
+                });
+                continue;
+            }
             if let Some(repo) = path.strip_suffix(b"/") {
+                // Only a directory holding a repository on disk is one; an
+                // index entry can claim the trailing slash for anything.
+                if fs::symlink_metadata(fs_path(dir, repo).join(".git")).is_err() {
+                    continue;
+                }
                 found.push(Found {
                     path: repo.to_vec(),
                     tracked,
@@ -928,6 +1003,7 @@ pub fn preview(data_dir: &Path, record: &SnapshotRecord, paths: &[String]) -> Re
     let excludes: Vec<String> = current
         .uncovered
         .iter()
+        .filter(|u| u.whole)
         .map(|u| format!(":(exclude,literal){}", u.path))
         .collect();
     let mut args = vec![
@@ -1690,6 +1766,123 @@ mod tests {
             rec.uncovered_note().unwrap(),
             "not covered: a/, b/c/, d/ (+2 more)"
         );
+    }
+
+    /// A version 2 index listing `paths` as regular files with blob `oid`,
+    /// written byte by byte: git itself refuses to add such paths.
+    fn raw_index(oid: &str, paths: &[&[u8]]) -> Vec<u8> {
+        let mut paths = paths.to_vec();
+        paths.sort();
+        let mut out = b"DIRC".to_vec();
+        out.extend(2u32.to_be_bytes());
+        out.extend((paths.len() as u32).to_be_bytes());
+        let oid: Vec<u8> = (0..20)
+            .map(|i| u8::from_str_radix(&oid[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        for path in paths {
+            let start = out.len();
+            out.extend([0u8; 24]); // ctime, mtime, dev, ino
+            out.extend(0o100644u32.to_be_bytes());
+            out.extend([0u8; 12]); // uid, gid, size
+            out.extend(&oid);
+            out.extend((path.len().min(0xfff) as u16).to_be_bytes());
+            out.extend(path);
+            // One to eight NULs, padding the entry to a multiple of eight.
+            out.extend(vec![0u8; 8 - (out.len() - start) % 8]);
+        }
+        // An all-zero checksum tells git not to verify it.
+        out.extend([0u8; 20]);
+        out
+    }
+
+    fn hash(repo: &Path, body: &str) -> String {
+        text(
+            git_raw(
+                repo,
+                &["hash-object", "--stdin"],
+                None,
+                &[],
+                Some(body.as_bytes().to_vec()),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn has_object(repo: &Path, oid: &str) -> bool {
+        git(repo, &["cat-file", "-e", oid], None).is_ok()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hostile_nested_index_cannot_pull_in_files_from_outside_the_repository() {
+        use std::os::unix::ffi::OsStrExt;
+        let base = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let outside = base.path().join("outside");
+        fs::create_dir_all(outside.join("private")).unwrap();
+        fs::write(outside.join("private/key"), "outside private key 7f3a").unwrap();
+        fs::write(outside.join("top.txt"), "outside top file 7f3a").unwrap();
+        let r = base.path().join("repo");
+        fs::create_dir(&r).unwrap();
+        sh(&r, &["init", "-q"]);
+        fs::write(r.join("a.txt"), "a").unwrap();
+        sh(&r, &["add", "a.txt"]);
+        sh(&r, &["commit", "-q", "-m", "init"]);
+
+        let sub = r.join("sub");
+        fs::create_dir(&sub).unwrap();
+        sh(&sub, &["init", "-q"]);
+        fs::write(sub.join("ok.txt"), "ok").unwrap();
+        fs::write(sub.join("tracked.txt"), "tracked").unwrap();
+        std::os::unix::fs::symlink(&outside, sub.join("link")).unwrap();
+        let blob = hash(&sub, "tracked");
+        let absolute = format!("{}/", outside.join("private").display());
+        let absolute_file = outside.join("top.txt");
+        // Alone in its index, this entry was hashed before git failed.
+        let evil = r.join("evil");
+        fs::create_dir(&evil).unwrap();
+        sh(&evil, &["init", "-q"]);
+        fs::write(evil.join("e.txt"), "e").unwrap();
+        fs::write(
+            evil.join(".git/index"),
+            raw_index(&blob, &[absolute.as_bytes()]),
+        )
+        .unwrap();
+        let hostile: Vec<&[u8]> = vec![
+            absolute.as_bytes(),
+            absolute_file.as_os_str().as_bytes(),
+            b"../../outside/private/",
+            b"../../outside/top.txt",
+            b"./ok.txt",
+            b"link/private/",
+            b"link/top.txt",
+            b"tracked.txt",
+        ];
+        fs::write(sub.join(".git/index"), raw_index(&blob, &hostile)).unwrap();
+
+        let rec = take(data.path(), &r, "s", "t", "git reset --hard")
+            .unwrap()
+            .unwrap();
+        for body in ["outside private key 7f3a", "outside top file 7f3a"] {
+            assert!(
+                !has_object(&r, &hash(&r, body)),
+                "{body:?} reached the outer object store"
+            );
+        }
+        // Only the bad entries are skipped; the rest of the repository is kept.
+        assert!(
+            in_tree(&r, &rec.commit, "sub/ok.txt"),
+            "{:?}",
+            rec.uncovered
+        );
+        assert!(in_tree(&r, &rec.commit, "sub/tracked.txt"));
+        assert!(in_tree(&r, &rec.commit, "evil/e.txt"));
+        let unsafe_paths = rec
+            .uncovered
+            .iter()
+            .filter(|u| u.contains("unsafe path"))
+            .count();
+        assert_eq!(unsafe_paths, 8, "{:?}", rec.uncovered);
     }
 
     #[test]
