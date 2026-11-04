@@ -132,12 +132,106 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+fn temp_index(data_dir: &Path, tag: &str) -> Result<TempFile> {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let tmp_dir = data_dir.join("tmp");
+    ensure_private_dir(&tmp_dir)?;
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(TempFile(
+        tmp_dir.join(format!("index-{tag}-{}-{n}", std::process::id())),
+    ))
+}
+
+/// Splits NUL-terminated git output into its records.
+fn split_z(out: &[u8]) -> impl Iterator<Item = &[u8]> {
+    out.split(|b| *b == 0).filter(|r| !r.is_empty())
+}
+
+fn join_z<'a>(items: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for item in items {
+        out.extend_from_slice(item);
+        out.push(0);
+    }
+    out
+}
+
+/// A git path (bytes, relative to `root`) as a filesystem path.
+fn fs_path(root: &Path, rel: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        root.join(std::ffi::OsStr::from_bytes(rel))
+    }
+    #[cfg(not(unix))]
+    {
+        root.join(String::from_utf8_lossy(rel).as_ref())
+    }
+}
+
+/// Index entries flagged skip-worktree and assume-unchanged, from
+/// `git ls-files -v`: `S`/`s` mark skip-worktree, lowercase marks
+/// assume-unchanged.
+#[derive(Default)]
+struct Flagged {
+    skip_worktree: Vec<Vec<u8>>,
+    assume_unchanged: Vec<Vec<u8>>,
+}
+
+fn flagged_paths(root: &Path, index: Option<&Path>) -> Result<Flagged> {
+    let out = git_raw(root, &["ls-files", "-v", "-z"], index, &[], None)?;
+    let mut flagged = Flagged::default();
+    for rec in split_z(&out) {
+        let (Some(&tag), Some(path)) = (rec.first(), rec.get(2..)) else {
+            continue;
+        };
+        if tag == b'S' || tag == b's' {
+            flagged.skip_worktree.push(path.to_vec());
+        }
+        if tag.is_ascii_lowercase() {
+            flagged.assume_unchanged.push(path.to_vec());
+        }
+    }
+    Ok(flagged)
+}
+
+/// The copied index keeps the user's skip-worktree and assume-unchanged
+/// bits, which make `git add` ignore local edits to those files. Clear them
+/// in the temporary index only. Skip-worktree files that are absent from
+/// disk (a sparse checkout) keep the bit, so they are stored as committed
+/// instead of as deleted.
+fn clear_index_flags(root: &Path, index: &Path) -> Result<()> {
+    let flagged = flagged_paths(root, Some(index))?;
+    let present: Vec<&[u8]> = flagged
+        .skip_worktree
+        .iter()
+        .map(Vec::as_slice)
+        .filter(|p| fs::symlink_metadata(fs_path(root, p)).is_ok())
+        .collect();
+    for (flag, paths) in [
+        ("--no-skip-worktree", present),
+        (
+            "--no-assume-unchanged",
+            flagged.assume_unchanged.iter().map(Vec::as_slice).collect(),
+        ),
+    ] {
+        if !paths.is_empty() {
+            git_raw(
+                root,
+                &["update-index", flag, "-z", "--stdin"],
+                Some(index),
+                &[],
+                Some(join_z(paths)),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Writes the current work tree (tracked and untracked, minus ignored files)
 /// as a git tree object, using a throwaway index. Returns the tree id.
 fn worktree_tree(data_dir: &Path, root: &Path, tag: &str) -> Result<String> {
-    let tmp_dir = data_dir.join("tmp");
-    ensure_private_dir(&tmp_dir)?;
-    let index = TempFile(tmp_dir.join(format!("index-{tag}-{}", std::process::id())));
+    let index = temp_index(data_dir, tag)?;
 
     // Seed the temp index from the real one so unchanged files are not rehashed.
     let real_index = git(root, &["rev-parse", "--git-path", "index"], None)?;
@@ -147,9 +241,71 @@ fn worktree_tree(data_dir: &Path, root: &Path, tag: &str) -> Result<String> {
     };
     if real_index.exists() {
         fs::copy(&real_index, &index.0).context("cannot copy git index")?;
+        clear_index_flags(root, &index.0)?;
     }
     git(root, &["add", "-A", "--", "."], Some(&index.0))?;
     git(root, &["write-tree"], Some(&index.0))
+}
+
+/// One file in a snapshot, by its path relative to the repository root.
+struct Entry {
+    path: Vec<u8>,
+}
+
+/// Lists the snapshot's files matching `paths` (all of them when empty),
+/// with the same pathspec rules `git restore` uses. Fails when a pathspec
+/// matches nothing, before anything has been changed.
+fn snapshot_entries(
+    data_dir: &Path,
+    repo: &Path,
+    commit: &str,
+    paths: &[String],
+) -> Result<Vec<Entry>> {
+    let index = temp_index(data_dir, "entries")?;
+    git(repo, &["read-tree", commit], Some(&index.0))?;
+    let mut args = vec!["ls-files", "-s", "-z", "--error-unmatch", "--"];
+    if paths.is_empty() {
+        args.push(".");
+    } else {
+        args.extend(paths.iter().map(String::as_str));
+    }
+    let out =
+        git_raw(repo, &args, Some(&index.0), &[], None).context("the snapshot has no such path")?;
+    Ok(split_z(&out)
+        .filter_map(|rec| {
+            let tab = rec.iter().position(|b| *b == b'\t')?;
+            Some(Entry {
+                path: rec[tab + 1..].to_vec(),
+            })
+        })
+        .collect())
+}
+
+/// Skip-worktree files that a whole-tree `git restore` would pass over but
+/// that hold work: present on disk, or different in the snapshot from the
+/// index. Absent and unchanged ones are sparse-checkout files; leave them.
+fn skip_worktree_to_restore(repo: &Path, commit: &str, entries: &[Entry]) -> Result<Vec<Vec<u8>>> {
+    let skip = flagged_paths(repo, None)?.skip_worktree;
+    if skip.is_empty() {
+        return Ok(Vec::new());
+    }
+    let in_snapshot: std::collections::HashSet<&[u8]> =
+        entries.iter().map(|e| e.path.as_slice()).collect();
+    let out = git_raw(
+        repo,
+        &["diff-index", "--cached", "--name-only", "-z", commit, "--"],
+        None,
+        &[],
+        None,
+    )?;
+    let differs: std::collections::HashSet<&[u8]> = split_z(&out).collect();
+    Ok(skip
+        .into_iter()
+        .filter(|p| in_snapshot.contains(p.as_slice()))
+        .filter(|p| {
+            differs.contains(p.as_slice()) || fs::symlink_metadata(fs_path(repo, p)).is_ok()
+        })
+        .collect())
 }
 
 /// Snapshots the repository containing `cwd`. Returns `Ok(None)` when `cwd`
@@ -278,6 +434,12 @@ pub fn restore(
         None,
     )
     .context("snapshot commit is missing (was it pruned?)")?;
+    let entries = snapshot_entries(data_dir, repo, &record.commit, paths)?;
+    let sparse_work = if paths.is_empty() {
+        skip_worktree_to_restore(repo, &record.commit, &entries)?
+    } else {
+        Vec::new()
+    };
     let backup = take(
         data_dir,
         repo,
@@ -286,13 +448,32 @@ pub fn restore(
         &format!("brakeline restore {}", record.id),
     )?;
     let source = format!("--source={}", record.commit);
-    let mut args = vec!["restore", source.as_str(), "--worktree", "--overlay", "--"];
+    let mut args = vec!["restore", source.as_str(), "--worktree", "--overlay"];
     if paths.is_empty() {
-        args.push(".");
+        args.extend(["--", "."]);
     } else {
+        // Paths the user names are restored even if flagged skip-worktree.
+        args.extend(["--ignore-skip-worktree-bits", "--"]);
         args.extend(paths.iter().map(String::as_str));
     }
     git(repo, &args, None)?;
+    if !sparse_work.is_empty() {
+        git_raw(
+            repo,
+            &[
+                "restore",
+                source.as_str(),
+                "--worktree",
+                "--overlay",
+                "--ignore-skip-worktree-bits",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
+            None,
+            &[("GIT_LITERAL_PATHSPECS", Path::new("1"))],
+            Some(join_z(sparse_work.iter().map(Vec::as_slice))),
+        )?;
+    }
     Ok(backup)
 }
 
@@ -444,6 +625,66 @@ mod tests {
         fs::remove_file(r.join("a.txt")).unwrap();
         restore(data.path(), &rec, &[]).unwrap();
         assert_eq!(fs::read_to_string(r.join("a.txt")).unwrap(), "a");
+    }
+
+    fn committed_repo(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        sh(r, &["init", "-q"]);
+        for (name, body) in files {
+            if let Some(parent) = Path::new(name).parent() {
+                fs::create_dir_all(r.join(parent)).unwrap();
+            }
+            fs::write(r.join(name), body).unwrap();
+        }
+        sh(r, &["add", "-A"]);
+        sh(r, &["commit", "-q", "-m", "init"]);
+        repo
+    }
+
+    #[test]
+    fn skip_worktree_and_assume_unchanged_edits_are_captured_and_restored() {
+        let repo = committed_repo(&[("cfg.txt", "v1"), ("b.txt", "v1"), ("sparse.txt", "v1")]);
+        let data = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        sh(
+            r,
+            &["update-index", "--skip-worktree", "cfg.txt", "sparse.txt"],
+        );
+        sh(r, &["update-index", "--assume-unchanged", "b.txt"]);
+        fs::write(r.join("cfg.txt"), "local cfg").unwrap();
+        fs::write(r.join("b.txt"), "local b").unwrap();
+        // Like a sparse checkout: flagged and absent from disk.
+        fs::remove_file(r.join("sparse.txt")).unwrap();
+        let index_before = fs::read(r.join(".git/index")).unwrap();
+
+        let rec = take(data.path(), r, "s", "t", "rm cfg.txt b.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read(r.join(".git/index")).unwrap(), index_before);
+        let show = |p: &str| git(r, &["show", &format!("{}:{p}", rec.commit)], None).unwrap();
+        assert_eq!(show("cfg.txt"), "local cfg");
+        assert_eq!(show("b.txt"), "local b");
+        assert_eq!(
+            show("sparse.txt"),
+            "v1",
+            "absent skip-worktree file keeps HEAD"
+        );
+
+        fs::remove_file(r.join("cfg.txt")).unwrap();
+        fs::remove_file(r.join("b.txt")).unwrap();
+        restore(data.path(), &rec, &[]).unwrap();
+        assert_eq!(fs::read_to_string(r.join("cfg.txt")).unwrap(), "local cfg");
+        assert_eq!(fs::read_to_string(r.join("b.txt")).unwrap(), "local b");
+        assert!(
+            !r.join("sparse.txt").exists(),
+            "a full restore must not materialize sparse files"
+        );
+
+        // Naming a skip-worktree path restores it as well.
+        fs::remove_file(r.join("cfg.txt")).unwrap();
+        restore(data.path(), &rec, &["cfg.txt".into()]).unwrap();
+        assert_eq!(fs::read_to_string(r.join("cfg.txt")).unwrap(), "local cfg");
     }
 
     #[test]
