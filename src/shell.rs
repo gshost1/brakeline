@@ -54,7 +54,11 @@ fn scan(command: &str, cfg: &ShellConfig, depth: usize, out: &mut Findings) {
     if cfg.block_catastrophic && compact.contains(":(){:|:&};:") {
         out.block("fork bomb".into());
     }
-    let (segments, too_deep) = tokenize(command);
+    let Tokens {
+        segments,
+        stdin_docs,
+        too_deep,
+    } = tokenize(command);
     if too_deep {
         let reason = "command nests too deeply to check".to_string();
         if cfg.block_catastrophic {
@@ -66,6 +70,53 @@ fn scan(command: &str, cfg: &ShellConfig, depth: usize, out: &mut Findings) {
     for segment in &segments {
         analyze_segment(&segment.words, &segment.writes, cfg, depth, out);
     }
+    // Heredoc bodies are data, unless a shell on this line reads its
+    // commands from stdin. Which segment a body feeds is not tracked, so any
+    // such shell makes every body count.
+    if depth < MAX_NESTING && segments.iter().any(|s| runs_stdin_as_commands(&s.words)) {
+        for doc in &stdin_docs {
+            scan(doc, cfg, depth + 1, out);
+        }
+    }
+}
+
+/// `bash`, `sh -s`, `sudo bash`, `docker exec -i box sh`, `ssh host`: a
+/// command that runs what it reads on stdin. `bash -c ...` and
+/// `bash script.sh` do not.
+fn runs_stdin_as_commands(words: &[String]) -> bool {
+    let words = strip_wrappers(words);
+    let Some(first) = words.first() else {
+        return false;
+    };
+    if matches!(basename(first), "ssh" | "su") {
+        return true;
+    }
+    let is_shell =
+        |w: &String| matches!(basename(w), "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish");
+    // Container and chroot launchers run a shell named further along.
+    let launcher = matches!(
+        basename(first),
+        "docker" | "podman" | "nerdctl" | "kubectl" | "chroot" | "nsenter" | "unshare"
+    );
+    let pos = if is_shell(first) {
+        0
+    } else if launcher && let Some(pos) = words.iter().position(is_shell) {
+        pos
+    } else {
+        return false;
+    };
+    for a in &words[pos + 1..] {
+        if a == "--" || !a.starts_with('-') {
+            return false; // a script file
+        }
+        if !a.starts_with("--") && a.contains('c') {
+            return false;
+        }
+        if !a.starts_with("--") && a.contains('s') {
+            return true;
+        }
+    }
+    true
 }
 
 /// Splits a command line into simple commands, honoring quotes. Operators
@@ -75,7 +126,7 @@ fn scan(command: &str, cfg: &ShellConfig, depth: usize, out: &mut Findings) {
 /// Comments, heredoc bodies and redirections are dropped.
 pub fn split_segments(input: &str) -> Vec<Vec<String>> {
     tokenize(input)
-        .0
+        .segments
         .into_iter()
         .map(|s| s.words)
         .filter(|w| !w.is_empty())
@@ -98,11 +149,22 @@ const MAX_LEX_DEPTH: usize = 64;
 /// trying, so adversarial input stays linear-ish.
 const MAX_ARITH_MISSES: usize = 64;
 
-/// Returns the segments and whether the command nested too deeply to read.
-fn tokenize(input: &str) -> (Vec<Segment>, bool) {
+struct Tokens {
+    segments: Vec<Segment>,
+    /// Heredoc bodies and here-strings: what the commands get on stdin.
+    stdin_docs: Vec<String>,
+    /// The command nested too deeply to read.
+    too_deep: bool,
+}
+
+fn tokenize(input: &str) -> Tokens {
     let mut lexer = Lexer::new(input, 0);
     lexer.parse_list(false);
-    (lexer.segments, lexer.too_deep)
+    Tokens {
+        segments: lexer.segments,
+        stdin_docs: lexer.stdin_docs,
+        too_deep: lexer.too_deep,
+    }
 }
 
 struct Heredoc {
@@ -118,6 +180,7 @@ struct Lexer {
     depth: usize,
     segments: Vec<Segment>,
     heredocs: Vec<Heredoc>,
+    stdin_docs: Vec<String>,
     too_deep: bool,
     arith_misses: usize,
 }
@@ -134,6 +197,7 @@ impl Lexer {
             depth,
             segments: Vec::new(),
             heredocs: Vec::new(),
+            stdin_docs: Vec::new(),
             too_deep: false,
             arith_misses: 0,
         }
@@ -172,6 +236,7 @@ impl Lexer {
         let mut sub = Lexer::new(text, self.depth + 1);
         f(&mut sub);
         self.segments.append(&mut sub.segments);
+        self.stdin_docs.append(&mut sub.stdin_docs);
         if sub.too_deep {
             self.give_up();
         }
@@ -443,7 +508,9 @@ impl Lexer {
             match self.peek() {
                 Some('<') if self.peek_at(1) == Some('<') => {
                     self.pos += 2;
-                    self.redirect_target();
+                    if let Some(text) = self.redirect_target() {
+                        self.stdin_docs.push(text);
+                    }
                 }
                 Some('<') => {
                     self.pos += 1;
@@ -543,6 +610,7 @@ impl Lexer {
             if !doc.quoted {
                 self.sub(&body, |l| l.expansions(&mut String::new(), None));
             }
+            self.stdin_docs.push(body);
         }
     }
 }
@@ -971,7 +1039,7 @@ pub fn mutates(command: &str) -> bool {
     ) {
         return true;
     }
-    tokenize(command).0.iter().any(|segment| {
+    tokenize(command).segments.iter().any(|segment| {
         let redirects = segment.writes.iter().any(|(_, t)| !is_scratch_device(t));
         let words = strip_wrappers(&segment.words);
         let program = words.first().map(|w| basename(w)).unwrap_or("");
@@ -1763,6 +1831,31 @@ mod tests {
         assert!(blocked("((cd x; rm -rf ~) )"));
         // Here-strings are one word, not a heredoc.
         assert!(blocked("cat <<< \"it's\"; rm -rf ~"));
+    }
+
+    #[test]
+    fn heredocs_fed_to_a_shell_are_commands() {
+        for cmd in [
+            "bash <<'EOF'\nrm -rf ~\nEOF",
+            "cat <<'EOF' | sh\nrm -rf ~\nEOF",
+            "sudo bash -s <<EOF\nrm -rf /\nEOF",
+            "bash -s -- arg <<'EOF'\nrm -rf ~\nEOF",
+            "ssh host <<'EOF'\nrm -rf ~\nEOF",
+            "docker exec -i box sh <<'EOF'\nrm -rf /\nEOF",
+            "bash <<< 'rm -rf ~'",
+            "sh -x <<'EOF'\ncd x\nrm -rf ~\nEOF",
+        ] {
+            assert!(blocked(cmd), "{cmd}");
+        }
+        assert!(destructive("bash <<'EOF'\ngit reset --hard\nEOF"));
+        for cmd in [
+            "bash -c 'cat' <<'EOF'\nrm -rf ~\nEOF",
+            "bash build.sh <<'EOF'\nrm -rf ~\nEOF",
+            "cat <<'EOF' > /tmp/x\nrm -rf ~\nEOF",
+            "grep bash <<'EOF'\nrm -rf ~\nEOF",
+        ] {
+            assert!(safe(cmd), "{cmd}");
+        }
     }
 
     #[test]
