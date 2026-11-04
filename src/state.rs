@@ -152,6 +152,7 @@ pub struct FailureStreak {
     pub fp: u64,
     pub label: String,
     pub consecutive: u32,
+    /// Failures in the current epoch, successes in between or not.
     pub total: u32,
     pub epoch: u64,
 }
@@ -223,12 +224,9 @@ impl SessionState {
     pub fn record_failure(&mut self, fp: u64, label: &str) {
         let epoch = self.epoch;
         let f = self.failure_mut(fp, label);
-        f.consecutive = if f.epoch == epoch {
-            f.consecutive + 1
-        } else {
-            1
-        };
-        f.total += 1;
+        let same_epoch = f.epoch == epoch;
+        f.consecutive = if same_epoch { f.consecutive + 1 } else { 1 };
+        f.total = if same_epoch { f.total + 1 } else { 1 };
         f.epoch = epoch;
     }
 
