@@ -60,63 +60,165 @@ fn scan(command: &str, cfg: &ShellConfig, depth: usize, out: &mut Findings) {
         too_deep,
     } = tokenize(command);
     if too_deep {
-        let reason = "command nests too deeply to check".to_string();
-        if cfg.block_catastrophic {
-            out.block(reason);
-        } else {
-            out.destructive(reason);
-        }
+        too_deep_to_check(cfg, out);
     }
     for segment in &segments {
         analyze_segment(&segment.words, &segment.writes, cfg, depth, out);
     }
-    // Heredoc bodies are data, unless a shell on this line reads its
-    // commands from stdin. Which segment a body feeds is not tracked, so any
-    // such shell makes every body count.
-    if depth < MAX_NESTING && segments.iter().any(|s| runs_stdin_as_commands(&s.words)) {
-        for doc in &stdin_docs {
-            scan(doc, cfg, depth + 1, out);
+    // Heredoc bodies and here-strings are commands unless they provably feed
+    // a program that only reads data. Which segment a pipe hands them to is
+    // not tracked, so any shell-like command on the line makes every body
+    // count.
+    if stdin_docs.is_empty() {
+        return;
+    }
+    // A body piped on to a command that is not a known data reader may be
+    // run too (`| $SHELL`, `| at now`, `| parallel`).
+    let line_runs_shell = segments
+        .iter()
+        .any(|s| feeds_shell(&s.words) || (s.piped && !is_data_sink(&s.words)));
+    for doc in &stdin_docs {
+        if !line_runs_shell && doc.is_data() {
+            continue;
+        }
+        if depth < MAX_NESTING {
+            scan(&doc.body, cfg, depth + 1, out);
+        } else {
+            too_deep_to_check(cfg, out);
         }
     }
 }
 
-/// `bash`, `sh -s`, `sudo bash`, `docker exec -i box sh`, `ssh host`: a
-/// command that runs what it reads on stdin. `bash -c ...` and
-/// `bash script.sh` do not.
-fn runs_stdin_as_commands(words: &[String]) -> bool {
+fn too_deep_to_check(cfg: &ShellConfig, out: &mut Findings) {
+    let reason = "command nests too deeply to check".to_string();
+    if cfg.block_catastrophic {
+        out.block(reason);
+    } else {
+        out.destructive(reason);
+    }
+}
+
+fn is_shell(program: &str) -> bool {
+    matches!(
+        program,
+        "bash" | "sh" | "zsh" | "dash" | "ksh" | "mksh" | "ash" | "fish" | "csh" | "tcsh"
+    )
+}
+
+/// A command that may run text it is given as shell commands: a shell,
+/// `eval`, `source`, `ssh`, `su`, `sudo -s`, container and chroot
+/// launchers. Errs towards yes.
+fn feeds_shell(words: &[String]) -> bool {
+    if starts_login_shell(words) {
+        return true;
+    }
     let words = strip_wrappers(words);
     let Some(first) = words.first() else {
         return false;
     };
-    if matches!(basename(first), "ssh" | "su") {
+    let program = basename(first);
+    // A program named by an expansion could be anything.
+    if program.contains(['$', '`']) {
         return true;
     }
-    let is_shell =
-        |w: &String| matches!(basename(w), "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish");
-    // Container and chroot launchers run a shell named further along.
-    let launcher = matches!(
-        basename(first),
-        "docker" | "podman" | "nerdctl" | "kubectl" | "chroot" | "nsenter" | "unshare"
-    );
-    let pos = if is_shell(first) {
-        0
-    } else if launcher && let Some(pos) = words.iter().position(is_shell) {
-        pos
-    } else {
-        return false;
-    };
-    for a in &words[pos + 1..] {
-        if a == "--" || !a.starts_with('-') {
-            return false; // a script file
-        }
-        if !a.starts_with("--") && a.contains('c') {
+    // `bash5`, `bash-5.2`.
+    is_shell(program.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.' || c == '-'))
+        || matches!(
+            program,
+            "eval"
+                | "source"
+                | "."
+                | "ssh"
+                | "su"
+                | "sudo"
+                | "doas"
+                | "busybox"
+                | "script"
+                | "docker"
+                | "podman"
+                | "nerdctl"
+                | "kubectl"
+                | "chroot"
+                | "nsenter"
+                | "unshare"
+        )
+}
+
+/// `sudo -s`, `sudo -i`, `sudo --login`, `doas -s`: the wrapper starts a
+/// shell, which reads commands from stdin when no command follows.
+fn starts_login_shell(words: &[String]) -> bool {
+    (0..words.len()).any(|i| {
+        let wrapper = basename(&words[i]);
+        if !matches!(wrapper, "sudo" | "doas") {
             return false;
         }
-        if !a.starts_with("--") && a.contains('s') {
-            return true;
+        let Some((shorts, longs)) = wrapper_value_options(wrapper) else {
+            return false;
+        };
+        let mut j = i + 1;
+        while let Some(opt) = words.get(j).filter(|o| o.starts_with('-') && *o != "--") {
+            j += 1;
+            if opt.starts_with("--sh")
+                || opt.starts_with("--lo")
+                || (!opt.starts_with("--") && opt.contains(['s', 'i']))
+            {
+                return true;
+            }
+            let next = words.get(j).map(String::as_str);
+            if value_option(opt, next, shorts, longs).is_some_and(|o| o.uses_next_word) {
+                j += 1;
+            }
         }
+        false
+    })
+}
+
+/// Programs that read stdin as data, never as shell commands. Interpreters
+/// of other languages count: a Python script is not judged as shell.
+fn is_data_sink(words: &[String]) -> bool {
+    let words = strip_wrappers(words);
+    let Some(first) = words.first() else {
+        return false;
+    };
+    let program = basename(first);
+    matches!(
+        program,
+        "cat"
+            | "tee"
+            | "git"
+            | "grep"
+            | "egrep"
+            | "fgrep"
+            | "rg"
+            | "wc"
+            | "sort"
+            | "head"
+            | "tail"
+            | "jq"
+            | "node"
+            | "ruby"
+            | "perl"
+    ) || program
+        .strip_prefix("python")
+        .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
+/// Takes a substitution's output as data when it is an argument of one of
+/// these: `git commit -m "$(cat <<'EOF' ... EOF)"`.
+fn takes_output_as_data(words: &[String]) -> bool {
+    is_data_sink(words)
+        || strip_wrappers(words)
+            .first()
+            .is_some_and(|w| matches!(basename(w), "echo" | "printf"))
+}
+
+impl StdinDoc {
+    /// Data only when it feeds a known data reader and, inside a
+    /// substitution, that substitution is an argument of one too.
+    fn is_data(&self) -> bool {
+        self.consumer_reads_data == Some(true)
+            && (!self.in_subst || self.outer_takes_data == Some(true))
     }
-    true
 }
 
 /// Splits a command line into simple commands, honoring quotes. Operators
@@ -139,6 +241,21 @@ pub fn split_segments(input: &str) -> Vec<Vec<String>> {
 struct Segment {
     words: Vec<String>,
     writes: Vec<(bool, String)>,
+    /// `stdin_docs` from this index on were found while reading it.
+    first_doc: usize,
+    /// Reads the output of the command before it through `|` or `|&`.
+    piped: bool,
+}
+
+/// Whether the next word is in command position: only reserved words that
+/// precede a command (`then case ...`, `do case ...`) come before it.
+fn at_command_start(words: &[String]) -> bool {
+    words.iter().all(|w| {
+        matches!(
+            w.as_str(),
+            "then" | "do" | "else" | "elif" | "if" | "while" | "until" | "{" | "!" | "time"
+        )
+    })
 }
 
 /// Nesting of substitutions, quotes and arithmetic the lexer follows before
@@ -149,10 +266,27 @@ const MAX_LEX_DEPTH: usize = 64;
 /// trying, so adversarial input stays linear-ish.
 const MAX_ARITH_MISSES: usize = 64;
 
+/// A heredoc body or here-string: what a command gets on stdin.
+#[derive(Debug, Default)]
+struct StdinDoc {
+    body: String,
+    /// Whether the command it is redirected into only reads data (see
+    /// `is_data_sink`); `None` if unknown.
+    consumer_reads_data: Option<bool>,
+    /// Inside `$(...)`, backticks or `<(...)`/`>(...)`, where what the
+    /// consumer prints may be run.
+    in_subst: bool,
+    /// For a doc inside a substitution: whether the outermost command that
+    /// has the substitution among its words takes its output as data.
+    outer_takes_data: Option<bool>,
+    /// The `parse_list` call whose segment it is redirected from.
+    list: usize,
+}
+
 struct Tokens {
     segments: Vec<Segment>,
     /// Heredoc bodies and here-strings: what the commands get on stdin.
-    stdin_docs: Vec<String>,
+    stdin_docs: Vec<StdinDoc>,
     /// The command nested too deeply to read.
     too_deep: bool,
 }
@@ -168,6 +302,8 @@ fn tokenize(input: &str) -> Tokens {
 }
 
 struct Heredoc {
+    /// Its entry in `stdin_docs`.
+    slot: usize,
     delimiter: String,
     strip_tabs: bool,
     /// A quoted delimiter turns off expansion in the body.
@@ -180,9 +316,18 @@ struct Lexer {
     depth: usize,
     segments: Vec<Segment>,
     heredocs: Vec<Heredoc>,
-    stdin_docs: Vec<String>,
+    stdin_docs: Vec<StdinDoc>,
     too_deep: bool,
     arith_misses: usize,
+    /// Once the arithmetic budget is spent, `<<` may be a shift the lexer
+    /// can no longer tell apart, so no heredoc is read: their bodies are
+    /// then scanned as commands rather than hiding later lines.
+    no_heredocs: bool,
+    /// How many substitutions enclose the current position.
+    subst: usize,
+    /// The `parse_list` call being read, and a counter to number them.
+    list: usize,
+    lists: usize,
 }
 
 fn is_metachar(c: char) -> bool {
@@ -200,6 +345,10 @@ impl Lexer {
             stdin_docs: Vec::new(),
             too_deep: false,
             arith_misses: 0,
+            no_heredocs: false,
+            subst: 0,
+            list: usize::MAX,
+            lists: 0,
         }
     }
 
@@ -227,16 +376,21 @@ impl Lexer {
     }
 
     /// Runs `f` on a fresh lexer over `text`, one level deeper, and keeps
-    /// the segments it finds.
-    fn sub(&mut self, text: &str, f: impl FnOnce(&mut Lexer)) {
+    /// the segments it finds. `subst` says whether `text` is the body of a
+    /// command substitution.
+    fn sub(&mut self, text: &str, subst: bool, f: impl FnOnce(&mut Lexer)) {
         if self.depth >= MAX_LEX_DEPTH {
             self.give_up();
             return;
         }
         let mut sub = Lexer::new(text, self.depth + 1);
+        sub.subst = self.subst + usize::from(subst);
         f(&mut sub);
         self.segments.append(&mut sub.segments);
-        self.stdin_docs.append(&mut sub.stdin_docs);
+        for mut doc in sub.stdin_docs {
+            doc.list = usize::MAX; // its consumer is settled
+            self.stdin_docs.push(doc);
+        }
         if sub.too_deep {
             self.give_up();
         }
@@ -266,6 +420,9 @@ impl Lexer {
             i += 1;
         }
         self.arith_misses += 1;
+        if self.arith_misses >= MAX_ARITH_MISSES {
+            self.no_heredocs = true;
+        }
         None
     }
 
@@ -277,20 +434,38 @@ impl Lexer {
             return;
         }
         self.depth += 1;
-        let mut cur = Segment::default();
+        let outer_list = self.list;
+        self.list = self.lists;
+        self.lists += 1;
+        let mut cur = Segment {
+            first_doc: self.stdin_docs.len(),
+            ..Segment::default()
+        };
         let mut parens = 0usize;
-        let mut cases = 0usize;
+        // For each open `case`, the subshell depth it sits at: a `)` there
+        // ends a pattern, not a subshell or the substitution.
+        let mut cases: Vec<usize> = Vec::new();
         while let Some(c) = self.peek() {
             match c {
                 '\n' => {
                     self.pos += 1;
                     self.end_segment(&mut cur);
                     self.read_heredocs();
+                    cur.first_doc = self.stdin_docs.len();
                 }
                 c if c.is_whitespace() => self.pos += 1,
-                ';' | '|' => {
+                ';' => {
                     self.pos += 1;
                     self.end_segment(&mut cur);
+                }
+                '|' => {
+                    self.pos += 1;
+                    let or = self.peek() == Some('|');
+                    if or || self.peek() == Some('&') {
+                        self.pos += 1;
+                    }
+                    self.end_segment(&mut cur);
+                    cur.piped = !or;
                 }
                 '&' if self.peek_at(1) == Some('>') => {
                     self.pos += 1;
@@ -308,7 +483,7 @@ impl Lexer {
                     if let Some(end) = arith {
                         let body: String = self.chars[self.pos + 2..end].iter().collect();
                         self.pos = end + 2;
-                        self.sub(&body, |l| l.expansions(&mut String::new(), None));
+                        self.sub(&body, false, |l| l.expansions(&mut String::new(), None));
                     } else {
                         self.pos += 1;
                         parens += 1;
@@ -317,9 +492,11 @@ impl Lexer {
                 ')' => {
                     self.pos += 1;
                     self.end_segment(&mut cur);
-                    if parens > 0 {
+                    if cases.last() == Some(&parens) {
+                        // a case pattern
+                    } else if parens > 0 {
                         parens -= 1;
-                    } else if in_subst && cases == 0 {
+                    } else if in_subst {
                         break;
                     }
                 }
@@ -341,10 +518,13 @@ impl Lexer {
                         self.redirect(&mut cur, false);
                         continue;
                     }
-                    if cur.words.is_empty() && !quoted {
+                    // `case` and `esac` count wherever a command can start.
+                    if !quoted && at_command_start(&cur.words) {
                         match word.as_str() {
-                            "case" => cases += 1,
-                            "esac" => cases = cases.saturating_sub(1),
+                            "case" => cases.push(parens),
+                            "esac" => {
+                                cases.pop();
+                            }
                             _ => {}
                         }
                     }
@@ -353,13 +533,38 @@ impl Lexer {
             }
         }
         self.end_segment(&mut cur);
+        self.list = outer_list;
         self.depth -= 1;
     }
 
+    /// Ends the current simple command. Heredocs and here-strings redirected
+    /// from it learn their consumer; those inside substitutions among its
+    /// words learn that it holds them.
     fn end_segment(&mut self, cur: &mut Segment) {
-        if !cur.words.is_empty() || !cur.writes.is_empty() {
+        let first_doc = cur.first_doc.min(self.stdin_docs.len());
+        let docs = &mut self.stdin_docs[first_doc..];
+        if !docs.is_empty() {
+            let reads_data = is_data_sink(&cur.words);
+            let takes_data = takes_output_as_data(&cur.words);
+            for doc in docs {
+                if doc.list == self.list {
+                    doc.consumer_reads_data.get_or_insert(reads_data);
+                } else {
+                    doc.outer_takes_data = Some(takes_data);
+                }
+            }
+        }
+        let empty = cur.words.is_empty() && cur.writes.is_empty();
+        // `a |` then a newline or comment: the pipe still feeds what follows.
+        let piped = empty && cur.piped;
+        if !empty {
             self.segments.push(std::mem::take(cur));
         }
+        *cur = Segment {
+            first_doc: self.stdin_docs.len(),
+            piped,
+            ..Segment::default()
+        };
     }
 
     /// Reads one shell word, removing quotes. `quoted` reports whether any
@@ -454,10 +659,12 @@ impl Lexer {
                 {
                     let body: String = self.chars[self.pos + 2..end].iter().collect();
                     self.pos = end + 2;
-                    self.sub(&body, |l| l.expansions(&mut String::new(), None));
+                    self.sub(&body, false, |l| l.expansions(&mut String::new(), None));
                 } else {
                     self.pos += 1;
+                    self.subst += 1;
                     self.parse_list(true);
+                    self.subst -= 1;
                 }
                 word.push_str(&self.source(start));
             }
@@ -496,7 +703,7 @@ impl Lexer {
                 c => inner.push(c),
             }
         }
-        self.sub(&inner, |l| l.parse_list(false));
+        self.sub(&inner, true, |l| l.parse_list(false));
         word.push_str(&self.source(start));
     }
 
@@ -509,8 +716,12 @@ impl Lexer {
                 Some('<') if self.peek_at(1) == Some('<') => {
                     self.pos += 2;
                     if let Some(text) = self.redirect_target() {
-                        self.stdin_docs.push(text);
+                        self.new_doc(text);
                     }
+                }
+                Some('<') if self.no_heredocs => {
+                    self.pos += 1;
+                    self.redirect_target();
                 }
                 Some('<') => {
                     self.pos += 1;
@@ -519,7 +730,9 @@ impl Lexer {
                         self.pos += 1;
                     }
                     if let Some((delimiter, quoted)) = self.redirect_word() {
+                        let slot = self.new_doc(String::new());
                         self.heredocs.push(Heredoc {
+                            slot,
                             delimiter,
                             strip_tabs,
                             quoted,
@@ -563,6 +776,18 @@ impl Lexer {
         }
     }
 
+    /// Records a heredoc or here-string redirected from the command being
+    /// read, and returns its slot.
+    fn new_doc(&mut self, body: String) -> usize {
+        self.stdin_docs.push(StdinDoc {
+            body,
+            in_subst: self.subst > 0,
+            list: self.list,
+            ..StdinDoc::default()
+        });
+        self.stdin_docs.len() - 1
+    }
+
     fn redirect_word(&mut self) -> Option<(String, bool)> {
         while self.peek().is_some_and(|c| c == ' ' || c == '\t') {
             self.pos += 1;
@@ -581,7 +806,9 @@ impl Lexer {
     fn process_substitution(&mut self) -> String {
         let start = self.pos - 1;
         self.pos += 1;
+        self.subst += 1;
         self.parse_list(true);
+        self.subst -= 1;
         self.source(start)
     }
 
@@ -608,9 +835,9 @@ impl Lexer {
                 body.push('\n');
             }
             if !doc.quoted {
-                self.sub(&body, |l| l.expansions(&mut String::new(), None));
+                self.sub(&body, false, |l| l.expansions(&mut String::new(), None));
             }
-            self.stdin_docs.push(body);
+            self.stdin_docs[doc.slot].body = body;
         }
     }
 }
@@ -896,12 +1123,19 @@ fn is_raw_device(target: &str) -> bool {
     target.starts_with("/dev/") && !is_scratch_device(target)
 }
 
-fn raw_device_write(target: &str, cfg: &ShellConfig, out: &mut Findings) {
-    let reason = format!("writes to the raw device `{target}`");
-    if cfg.block_catastrophic {
-        out.block(reason);
-    } else {
-        out.destructive(reason);
+/// Judges one write to `target` by `what` (`> f`, `tee f`, `dd of=f`): a
+/// device that is not scratch space is a disk; otherwise a truncating
+/// write outside scratch space loses the old contents.
+fn judge_write(target: &str, truncates: bool, what: &str, cfg: &ShellConfig, out: &mut Findings) {
+    if is_raw_device(target) {
+        let reason = format!("writes to the raw device `{target}`");
+        if cfg.block_catastrophic {
+            out.block(reason);
+        } else {
+            out.destructive(reason);
+        }
+    } else if truncates && !is_scratch_target(target) {
+        out.destructive(format!("`{what}` overwrites the file"));
     }
 }
 
@@ -920,14 +1154,8 @@ fn analyze_segment(
     depth: usize,
     out: &mut Findings,
 ) {
-    if let Some((_, target)) = writes.iter().find(|(_, t)| is_raw_device(t)) {
-        raw_device_write(target, cfg, out);
-    }
-    if let Some((_, target)) = writes
-        .iter()
-        .find(|(truncates, t)| *truncates && !is_scratch_target(t) && !is_raw_device(t))
-    {
-        out.destructive(format!("`> {target}` overwrites the file"));
+    for (truncates, target) in writes {
+        judge_write(target, *truncates, &format!("> {target}"), cfg, out);
     }
     let words = strip_wrappers(segment);
     let Some(first) = words.first() else { return };
@@ -935,7 +1163,7 @@ fn analyze_segment(
     let args = &words[1..];
 
     match program {
-        "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish" => {
+        p if is_shell(p) => {
             if let Some(pos) = args.iter().position(|a| {
                 a == "-c" || (a.starts_with('-') && !a.starts_with("--") && a.contains('c'))
             }) && let Some(inner) = args.get(pos + 1)
@@ -969,17 +1197,8 @@ fn analyze_segment(
             }
         }
         "dd" => {
-            if cfg.block_catastrophic
-                && args
-                    .iter()
-                    .any(|a| a.strip_prefix("of=").is_some_and(is_raw_device))
-            {
-                out.block("`dd` writing to a raw device".into());
-            } else if args
-                .iter()
-                .any(|a| a.strip_prefix("of=").is_some_and(|t| !is_scratch_target(t)))
-            {
-                out.destructive("`dd` overwrites its output file".into());
+            for target in args.iter().filter_map(|a| a.strip_prefix("of=")) {
+                judge_write(target, true, &format!("dd of={target}"), cfg, out);
             }
         }
         p if p.starts_with("mkfs") => {
@@ -1118,6 +1337,10 @@ fn analyze_tee(args: &[String], cfg: &ShellConfig, out: &mut Findings) {
     let mut targets = Vec::new();
     let mut end_of_options = false;
     for a in args {
+        // `>(cmd)` is a pipe; its command is judged as a segment of its own.
+        if a.starts_with(">(") || a.starts_with("<(") {
+            continue;
+        }
         if end_of_options || !a.starts_with('-') || a == "-" {
             targets.push(a.as_str());
         } else if a == "--" {
@@ -1126,15 +1349,8 @@ fn analyze_tee(args: &[String], cfg: &ShellConfig, out: &mut Findings) {
             append = true;
         }
     }
-    if let Some(t) = targets.iter().find(|t| is_raw_device(t)) {
-        raw_device_write(t, cfg, out);
-    }
-    if !append
-        && let Some(t) = targets
-            .iter()
-            .find(|t| **t != "-" && !is_scratch_target(t) && !is_raw_device(t))
-    {
-        out.destructive(format!("`tee {t}` overwrites the file"));
+    for t in targets.into_iter().filter(|t| *t != "-") {
+        judge_write(t, !append, &format!("tee {t}"), cfg, out);
     }
 }
 
@@ -1392,14 +1608,11 @@ fn is_catastrophic_target(target: &str) -> bool {
         return true;
     }
     // A single user's home directory or everything in it, e.g. /Users/alice,
-    // /home/bob/*, ~carol.
+    // /home/bob/*, /home/$USER, ~carol. Any single component counts.
     let home = t.strip_suffix("/*").map_or(t, |b| b.trim_end_matches('/'));
     for prefix in ["/Users/", "/home/", "~"] {
         if let Some(rest) = home.strip_prefix(prefix)
-            && rest
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && !rest.is_empty()
             && !rest.contains('/')
         {
             return true;
@@ -1849,13 +2062,106 @@ mod tests {
         }
         assert!(destructive("bash <<'EOF'\ngit reset --hard\nEOF"));
         for cmd in [
-            "bash -c 'cat' <<'EOF'\nrm -rf ~\nEOF",
-            "bash build.sh <<'EOF'\nrm -rf ~\nEOF",
             "cat <<'EOF' > /tmp/x\nrm -rf ~\nEOF",
             "grep bash <<'EOF'\nrm -rf ~\nEOF",
         ] {
             assert!(safe(cmd), "{cmd}");
         }
+    }
+
+    #[test]
+    fn heredocs_are_commands_unless_a_data_reader_takes_them() {
+        for cmd in [
+            // Inside a substitution whose output is run.
+            "eval \"$(cat <<'EOF'\nrm -rf ~\nEOF\n)\"",
+            "bash -c \"$(cat <<'EOF'\nrm -rf ~\nEOF\n)\"",
+            "$(cat <<'EOF'\nrm -rf ~\nEOF\n)",
+            "echo \"$(cat <<'EOF'\nrm -rf ~\nEOF\n)\" | sh",
+            "bash <(cat <<EOF\nrm -rf ~\nEOF\n)",
+            "x=`cat <<EOF\nrm -rf ~\nEOF\n`",
+            // Shell options with values are not a script file.
+            "bash -e -o pipefail <<'EOF'\nrm -rf ~\nEOF",
+            "bash -O extglob <<EOF\nrm -rf ~\nEOF",
+            "bash --rcfile x.rc <<EOF\nrm -rf ~\nEOF",
+            // A wrapper that starts a shell.
+            "sudo -s <<'EOF'\nrm -rf /\nEOF",
+            "sudo -i <<EOF\nrm -rf /\nEOF",
+            "doas -s <<EOF\nrm -rf /\nEOF",
+            "cat <<EOF | sudo -u root -s\nrm -rf /\nEOF",
+            "cat <<EOF | sudo --user root --login\nrm -rf /\nEOF",
+            // Piped on to something that may run it.
+            "cat <<'EOF' | $SHELL\nrm -rf ~\nEOF",
+            "cat <<'EOF' | bash-5.2\nrm -rf ~\nEOF",
+            "cat <<'EOF' | at now\nrm -rf ~\nEOF",
+            "cat <<'EOF' | parallel\nrm -rf ~\nEOF",
+            "cat <<'EOF' |\nrm -rf ~\nEOF\n  sh",
+            "cat <<'EOF' |& sh\nrm -rf ~\nEOF",
+            "cat <<'EOF' | sort | sh\nrm -rf ~\nEOF",
+            // Reading stdin as a script.
+            "bash /dev/stdin <<'EOF'\nrm -rf ~\nEOF",
+            "source /dev/stdin <<EOF\nrm -rf ~\nEOF",
+            ". /dev/stdin <<EOF\nrm -rf ~\nEOF",
+            // A script given stdin may run it; and an unknown consumer.
+            "bash -c 'cat' <<'EOF'\nrm -rf ~\nEOF",
+            "bash build.sh <<'EOF'\nrm -rf ~\nEOF",
+            "mystery-tool <<'EOF'\nrm -rf ~\nEOF",
+            "mystery-tool <<< 'rm -rf ~'",
+            // A data reader, but a shell elsewhere on the line.
+            "cat <<EOF | python3\nimport os\nEOF\nbash <<X\nrm -rf ~\nX",
+            "cat > x.sh <<'EOF'\nrm -rf ~\nEOF\nbash x.sh",
+        ] {
+            assert!(blocked(cmd), "{cmd}");
+        }
+        for cmd in [
+            "cat > /tmp/notes.md <<'EOF'\ngit push --force origin main\nEOF",
+            "git commit -F - <<'EOF'\nfix: rm -rf handling\nEOF",
+            "python3 - <<'EOF'\nimport shutil\nEOF",
+            "python3.12 - <<'EOF'\nrm -rf ~\nEOF",
+            "git commit -m \"$(cat <<'EOF'\nfix: rm -rf ~ handling\nIt's done\nEOF\n)\"",
+            "git commit -m \"`cat <<EOF\nrm -rf ~\nEOF\n`\"",
+            "jq . <<< '{\"rm\": \"rm -rf ~\"}'",
+            "cat <<'EOF' | sort | head -n 3\nrm -rf ~\nEOF",
+            "cat <<'EOF' > /tmp/x || echo failed\nrm -rf ~\nEOF",
+        ] {
+            assert!(safe(cmd), "{cmd}");
+        }
+        assert_eq!(
+            classify(
+                "cat > scripts/clean.sh <<'EOF'\n#!/bin/sh\nrm -rf \"$OUT_DIR\"/*\nEOF",
+                &cfg()
+            ),
+            Verdict::Destructive("`> scripts/clean.sh` overwrites the file".into())
+        );
+        // Past the nesting limit a body that must be read is not skipped.
+        assert!(blocked(
+            "bash -c \"bash -c 'bash -c \\\"bash <<< true\\\"'\""
+        ));
+    }
+
+    #[test]
+    fn spent_arithmetic_budget_reads_no_heredocs() {
+        let misses = "((a) ); ".repeat(MAX_ARITH_MISSES);
+        assert!(blocked(&format!("{misses}echo $((1<<2))\nrm -rf ~")));
+        assert!(blocked(&format!("{misses}(( x = 1 << 2 ))\nrm -rf ~")));
+        // Real heredocs after that point are read as commands.
+        assert!(blocked(&format!("{misses}cat <<EOF\nrm -rf ~\nEOF")));
+    }
+
+    #[test]
+    fn case_counts_at_any_command_position() {
+        for cmd in [
+            "echo \"$(if true; then case a in a) rm -rf ~;; esac; fi)\"",
+            "echo \"$(for x in 1; do case a in a) rm -rf ~;; esac; done)\"",
+            "echo \"$(if false; then :; else case a in a) rm -rf ~;; esac; fi)\"",
+            "echo \"$({ case a in a) rm -rf ~;; esac; })\"",
+            "echo \"$(true && case a in a) rm -rf ~;; esac)\"",
+            "echo \"$( (case a in a) echo;; esac); rm -rf ~ )\"",
+            "echo \"$(case a in (a) echo;; esac)\"; rm -rf ~",
+        ] {
+            assert!(blocked(cmd), "{cmd}");
+        }
+        // The substitution ends after `esac`; the rest is quoted text.
+        assert!(safe("echo \"$(case a in (a) echo;; esac); rm -rf ~\""));
     }
 
     #[test]
@@ -1868,6 +2174,7 @@ mod tests {
         assert!(blocked("echo \"$(echo \")\"; rm -rf ~)\""));
         assert!(blocked("diff <(ls) <(rm -rf ~)"));
         assert!(blocked("tee >(rm -rf ~) < /dev/null"));
+        assert!(blocked("echo x | tee >(rm -rf ~)"));
         assert!(blocked("x=$(echo $(rm -rf ~))"));
         assert!(blocked("x=$( (cd a; ls) ; rm -rf ~)"));
         assert!(blocked("echo \"$(case $x in a) rm -rf ~;; esac)\""));
@@ -1958,8 +2265,18 @@ mod tests {
         ] {
             assert!(blocked(cmd), "{cmd}");
         }
+        for cmd in [
+            "rm -rf /Users/$USER",
+            "rm -rf /home/$USER",
+            "rm -rf \"/Users/$(whoami)\"",
+            "rm -rf /home/.snapshots",
+            "rm -rf /Users/$USER/*",
+        ] {
+            assert!(blocked(cmd), "{cmd}");
+        }
         assert!(destructive("rm -rf /Users/alice/project/*"));
         assert!(destructive("rm -rf /home/bob/build"));
+        assert!(destructive("rm -rf /home/$USER/build"));
     }
 
     #[test]
@@ -2111,6 +2428,7 @@ mod tests {
             "echo x | tee src/lib.rs",
             "echo x | tee -p out.txt",
             "echo x | tee -- -a",
+            "echo x | tee >(wc -l) out.txt",
             "rsync -a --delete dist/ src/",
             "rsync -av --delete-after a/ b/",
             "rsync -a --del a/ b/",
@@ -2124,6 +2442,8 @@ mod tests {
             "echo x | tee /tmp/x",
             "echo x | tee /dev/null",
             "echo x | tee",
+            "echo x | tee >(gzip > /tmp/out.gz)",
+            "echo x | tee >(wc -l) /tmp/x",
             "rsync -a dist/ out/",
             "cp a b",
         ] {
