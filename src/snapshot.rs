@@ -28,18 +28,33 @@ pub struct SnapshotRecord {
     pub created_at: u64,
 }
 
-fn git(repo: &Path, args: &[&str], index: Option<&Path>) -> Result<String> {
+/// Runs git in `repo` and returns its raw stdout. `env` adds variables (such
+/// as `GIT_DIR`), and `input` is written to stdin.
+fn git_raw(
+    repo: &Path,
+    args: &[&str],
+    index: Option<&Path>,
+    env: &[(&str, &Path)],
+    input: Option<Vec<u8>>,
+) -> Result<Vec<u8>> {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(repo)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(index) = index {
         cmd.env("GIT_INDEX_FILE", index);
+    }
+    for (key, value) in env {
+        cmd.env(key, value);
     }
     // Snapshot objects are not user history; give them a fixed identity so
     // they work on machines with no git identity configured.
@@ -47,7 +62,18 @@ fn git(repo: &Path, args: &[&str], index: Option<&Path>) -> Result<String> {
         .env("GIT_AUTHOR_EMAIL", "brakeline@localhost")
         .env("GIT_COMMITTER_NAME", "brakeline")
         .env("GIT_COMMITTER_EMAIL", "brakeline@localhost");
-    let out = cmd.output().context("failed to run git")?;
+    let mut child = cmd.spawn().context("failed to run git")?;
+    // Feed stdin from a thread so a large output cannot deadlock against it.
+    let writer = match (input, child.stdin.take()) {
+        (Some(data), Some(mut stdin)) => Some(std::thread::spawn(move || {
+            let _ = stdin.write_all(&data);
+        })),
+        _ => None,
+    };
+    let out = child.wait_with_output().context("failed to run git")?;
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
     if !out.status.success() {
         bail!(
             "git {} failed: {}",
@@ -55,7 +81,18 @@ fn git(repo: &Path, args: &[&str], index: Option<&Path>) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(out.stdout)
+}
+
+/// Runs git and returns stdout minus its final newline. Only the newline is
+/// removed: a path such as the repository root may itself end in whitespace.
+fn git(repo: &Path, args: &[&str], index: Option<&Path>) -> Result<String> {
+    let out = git_raw(repo, args, index, &[], None)?;
+    let mut text = String::from_utf8_lossy(&out).into_owned();
+    if text.ends_with('\n') {
+        text.pop();
+    }
+    Ok(text)
 }
 
 pub fn repo_root(cwd: &Path) -> Option<PathBuf> {
@@ -390,6 +427,23 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn repo_path_ending_in_a_space_is_snapshotted() {
+        let base = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let r = base.path().join("sp ");
+        fs::create_dir(&r).unwrap();
+        sh(&r, &["init", "-q"]);
+        fs::write(r.join("a.txt"), "a").unwrap();
+        let rec = take(data.path(), &r, "s", "t", "rm a.txt")
+            .unwrap()
+            .unwrap();
+        assert!(rec.repo.ends_with("sp "), "{:?}", rec.repo);
+        fs::remove_file(r.join("a.txt")).unwrap();
+        restore(data.path(), &rec, &[]).unwrap();
+        assert_eq!(fs::read_to_string(r.join("a.txt")).unwrap(), "a");
     }
 
     #[test]
