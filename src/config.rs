@@ -349,6 +349,21 @@ pub fn load(cwd: Option<&Path>) -> (Config, Vec<String>) {
     load_from(user_config_path().as_deref(), cwd)
 }
 
+/// Like [`load`], for commands the user runs by hand (`check`, `config`):
+/// a broken user config is an error instead of a silent fall back to the
+/// defaults, which can be looser than what the user wrote. A broken project
+/// config is still only a notice.
+pub fn load_strict(cwd: Option<&Path>) -> Result<(Config, Vec<String>)> {
+    load_strict_from(user_config_path().as_deref(), cwd)
+}
+
+fn load_strict_from(user: Option<&Path>, cwd: Option<&Path>) -> Result<(Config, Vec<String>)> {
+    let mut cfg = load_user_from(user)?;
+    let mut notices = Vec::new();
+    tighten_with_project(&mut cfg, cwd, &mut notices);
+    Ok((cfg, notices))
+}
+
 fn load_from(user: Option<&Path>, cwd: Option<&Path>) -> (Config, Vec<String>) {
     let mut notices = Vec::new();
     let mut cfg = load_user_from(user).unwrap_or_else(|err| {
@@ -357,6 +372,11 @@ fn load_from(user: Option<&Path>, cwd: Option<&Path>) -> (Config, Vec<String>) {
         ));
         Config::default()
     });
+    tighten_with_project(&mut cfg, cwd, &mut notices);
+    (cfg, notices)
+}
+
+fn tighten_with_project(cfg: &mut Config, cwd: Option<&Path>, notices: &mut Vec<String>) {
     if let Some(cwd) = cwd {
         match read_toml::<ProjectConfig>(&project_config_path(cwd)) {
             Ok(Some(project)) => cfg.tighten_with(&project),
@@ -366,7 +386,6 @@ fn load_from(user: Option<&Path>, cwd: Option<&Path>) -> (Config, Vec<String>) {
             )),
         }
     }
-    (cfg, notices)
 }
 
 #[cfg(test)]
@@ -528,6 +547,24 @@ mod tests {
             vec!["terraform destroy", "drop table"]
         );
         assert!(notices.is_empty(), "{notices:?}");
+    }
+
+    #[test]
+    fn strict_load_fails_on_a_broken_user_config_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join(".brakeline.toml"), "bogus_key = 1\n").unwrap();
+        let user = dir.path().join("user.toml");
+        std::fs::write(&user, "[budget]\nmax_cost_usd = -1.0\n").unwrap();
+        let err = load_strict_from(Some(&user), Some(&repo)).unwrap_err();
+        assert!(format!("{err:#}").contains("user.toml"), "{err:#}");
+
+        // A broken project config is still a notice on top of the user config.
+        let user = user_file(dir.path());
+        let (cfg, notices) = load_strict_from(Some(&user), Some(&repo)).unwrap();
+        assert_eq!(cfg.budget.max_cost_usd, Some(5.0));
+        assert_eq!(notices.len(), 1, "{notices:?}");
     }
 
     #[test]

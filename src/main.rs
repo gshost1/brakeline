@@ -131,21 +131,31 @@ fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// Loads the effective config for a CLI command, warning on stderr about any
-/// config file that could not be used.
-fn load_config(cwd: Option<&Path>) -> config::Config {
-    let (cfg, notices) = config::load(cwd);
+/// Loads the effective config for a CLI command. A broken user config is
+/// an error; a broken project config is a warning on stderr.
+fn load_config(cwd: Option<&Path>) -> Result<config::Config> {
+    let (cfg, notices) = config::load_strict(cwd)?;
     for notice in notices {
         eprintln!("warning: {notice}");
     }
-    cfg
+    Ok(cfg)
+}
+
+/// Joins the config notices and, when brakeline's state is unavailable, a
+/// notice saying so, into the one notice the hook shows.
+fn hook_notice(config_notices: &[String], state_error: Option<&anyhow::Error>) -> Option<String> {
+    let mut lines = config_notices.to_vec();
+    if let Some(err) = state_error {
+        lines.push(format!("brakeline state unavailable: {err:#}"));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Cmd::Hook { format, agent } => run_hook(format, matches!(agent, Agent::Droid)),
         Cmd::Check { command } => {
-            let cfg = load_config(Some(&cwd()));
+            let cfg = load_config(Some(&cwd()))?;
             let line = command.join(" ");
             let verdict = shell::classify(&line, &cfg.shell);
             match &verdict {
@@ -288,7 +298,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Config => {
-            let cfg = load_config(Some(&cwd()));
+            let cfg = load_config(Some(&cwd()))?;
             if let Some(p) = config::user_config_path() {
                 println!("# user config: {}", p.display());
             }
@@ -338,7 +348,6 @@ fn run_hook(format: HookFormat, infer_failures: bool) -> Result<ExitCode> {
     let cwd = input.cwd.as_deref().map(Path::new);
 
     let (cfg, notices) = config::load(cwd);
-    let notice = (!notices.is_empty()).then(|| notices.join("\n"));
     let format = match format {
         HookFormat::Json => Format::Json,
         HookFormat::ExitCode => Format::ExitCode,
@@ -347,7 +356,7 @@ fn run_hook(format: HookFormat, infer_failures: bool) -> Result<ExitCode> {
         Ok(store) => Engine {
             cfg: &cfg,
             store: &store,
-            notice,
+            notice: hook_notice(&notices, None),
             infer_failures,
         }
         .handle(&input),
@@ -359,7 +368,7 @@ fn run_hook(format: HookFormat, infer_failures: bool) -> Result<ExitCode> {
             let out = Engine {
                 cfg: &cfg,
                 store: &store,
-                notice: Some(format!("brakeline state unavailable: {err:#}")),
+                notice: hook_notice(&notices, Some(&err)),
                 infer_failures,
             }
             .handle(&input);
@@ -463,4 +472,24 @@ fn status(session: Option<String>, json: bool) -> Result<ExitCode> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_notice_keeps_config_notices_when_state_is_unavailable() {
+        assert_eq!(hook_notice(&[], None), None);
+        let notices = vec!["project config ignored".to_string()];
+        assert_eq!(
+            hook_notice(&notices, None).as_deref(),
+            Some("project config ignored")
+        );
+        let err = anyhow::anyhow!("read-only home");
+        assert_eq!(
+            hook_notice(&notices, Some(&err)).as_deref(),
+            Some("project config ignored\nbrakeline state unavailable: read-only home")
+        );
+    }
 }
