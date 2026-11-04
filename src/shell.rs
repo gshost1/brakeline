@@ -121,7 +121,9 @@ fn too_deep_to_check(cfg: &ShellConfig, out: &mut Findings) {
     }
 }
 
+/// A shell by name, including versioned ones (`bash5`, `bash-5.2`).
 fn is_shell(program: &str) -> bool {
+    let program = program.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.' || c == '-');
     matches!(
         program,
         "bash" | "sh" | "zsh" | "dash" | "ksh" | "mksh" | "ash" | "fish" | "csh" | "tcsh"
@@ -144,8 +146,7 @@ fn feeds_shell(words: &[String]) -> bool {
     if program.contains(['$', '`']) {
         return true;
     }
-    // `bash5`, `bash-5.2`.
-    is_shell(program.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.' || c == '-'))
+    is_shell(program)
         || matches!(
             program,
             "eval"
@@ -696,16 +697,56 @@ impl Lexer {
                 while let Some(q) = self.bump() {
                     match q {
                         '\'' => break,
-                        '\\' => {
-                            if let Some(n) = self.bump() {
-                                word.push(n);
-                            }
-                        }
+                        '\\' => self.ansi_c_escape(word),
                         q => word.push(q),
                     }
                 }
             }
             _ => word.push('$'),
+        }
+    }
+
+    /// After a backslash inside `$'...'`: decode the escape the way bash
+    /// does, so `$'\x72\x6d'` reads as `rm`.
+    fn ansi_c_escape(&mut self, word: &mut String) {
+        let Some(n) = self.bump() else { return };
+        let number = |lexer: &mut Self, radix: u32, max: usize, first: Option<char>| {
+            let mut digits: String = first.into_iter().collect();
+            while digits.len() < max
+                && let Some(d) = lexer.peek().filter(|d| d.is_digit(radix))
+            {
+                digits.push(d);
+                lexer.pos += 1;
+            }
+            u32::from_str_radix(&digits, radix)
+                .ok()
+                .and_then(char::from_u32)
+        };
+        let decoded = match n {
+            'x' => number(self, 16, 2, None),
+            'u' => number(self, 16, 4, None),
+            'U' => number(self, 16, 8, None),
+            '0'..='7' => number(self, 8, 3, Some(n)),
+            'n' => Some('\n'),
+            't' => Some('\t'),
+            'r' => Some('\r'),
+            'a' => Some('\u{7}'),
+            'b' => Some('\u{8}'),
+            'e' | 'E' => Some('\u{1b}'),
+            'f' => Some('\u{c}'),
+            'v' => Some('\u{b}'),
+            'c' => self
+                .bump()
+                .map(|c| char::from((c.to_ascii_uppercase() as u8) ^ 0x40)),
+            other => Some(other),
+        };
+        match decoded {
+            Some(c) => word.push(c),
+            // `\x` with no digits stays as written.
+            None => {
+                word.push('\\');
+                word.push(n);
+            }
         }
     }
 
@@ -896,7 +937,7 @@ fn wrapper_value_options(wrapper: &str) -> Option<(&'static str, &'static [&'sta
         "doas" => ("aCu", &[]),
         "env" => ("CLPSu", &["chdir", "split-string", "unset"]),
         "exec" => ("a", &[]),
-        "command" | "builtin" | "nohup" => ("", &[]),
+        "command" | "builtin" | "nohup" | "busybox" => ("", &[]),
         "time" => ("fo", &["format", "output"]),
         "nice" => ("n", &["adjustment"]),
         "xargs" => (
@@ -1136,9 +1177,10 @@ fn is_scratch_device(target: &str) -> bool {
             | "/dev/stdout"
             | "/dev/stderr"
             | "/dev/console"
-    ) || ["/dev/fd/", "/dev/tty", "/dev/pts/", "/dev/shm/"]
+    ) || (["/dev/fd/", "/dev/tty", "/dev/pts/", "/dev/shm/"]
         .iter()
         .any(|p| target.starts_with(p))
+        && !target.split('/').any(|part| part == ".."))
 }
 
 /// Any other device file, such as a disk.
@@ -1189,7 +1231,10 @@ fn analyze_segment(
         p if is_shell(p) => {
             if let Some(pos) = args.iter().position(|a| {
                 a == "-c" || (a.starts_with('-') && !a.starts_with("--") && a.contains('c'))
-            }) && let Some(inner) = args.get(pos + 1)
+            }) && let Some(inner) = args
+                .get(pos + 1)
+                .filter(|a| *a != "--")
+                .or_else(|| args.get(pos + 2))
                 && depth < MAX_NESTING
             {
                 scan(inner, cfg, depth + 1, out);
@@ -1279,7 +1324,7 @@ pub fn mutates(command: &str) -> bool {
         return true;
     }
     if matches!(
-        classify(command, &ShellConfig::default()),
+        classify_new(command, &ShellConfig::default()),
         Verdict::Destructive(_)
     ) {
         return true;
@@ -2553,9 +2598,7 @@ mod combined {
             "echo ${x:- #}; rm -rf ~",
             "(( x = '))' )); rm -rf ~",
             "(( '))' )) && rm -rf ~",
-            "cat <<$'E\\x4fF'\nhi\nEOF\nrm -rf ~",
             "cat > x.sh <<EOF\nrm -rf ~\nEOF\n./x.sh",
-            "dd if=/dev/zero of=/dev/fd/../disk0",
         ] {
             assert!(
                 !matches!(new_only(cmd), Verdict::Blocked(_)),
@@ -2563,6 +2606,32 @@ mod combined {
             );
             assert!(matches!(verdict(cmd), Verdict::Blocked(_)), "{cmd:?}");
         }
+    }
+
+    /// Bypasses both parsers missed, found in review.
+    #[test]
+    fn review_bypasses_are_blocked() {
+        for cmd in [
+            "echo x > /dev/shm/../sda",
+            "cat img | tee /dev/pts/../sda",
+            "$'\\x72\\x6d' -rf ~",
+            "$'\\162\\155' -rf ~",
+            "bash5 -c 'rm -rf ~'",
+            "bash-5.2 -c 'rm -rf ~'",
+            "busybox rm -rf ~",
+            "busybox sh -c 'rm -rf ~'",
+            "bash -c -- 'rm -rf ~'",
+            "cat <<$'E\\x4fF'\nhi\nEOF\nrm -rf ~",
+            "dd if=/dev/zero of=/dev/fd/../disk0",
+        ] {
+            assert!(
+                matches!(verdict(cmd), Verdict::Blocked(_)),
+                "{cmd:?}: {:?}",
+                verdict(cmd)
+            );
+        }
+        assert_eq!(verdict("echo $'a\\tb\\x'"), Verdict::Safe);
+        assert_eq!(verdict("echo hi > /dev/shm/scratch"), Verdict::Safe);
     }
 
     #[test]
