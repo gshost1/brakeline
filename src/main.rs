@@ -275,13 +275,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
             let backup = snapshot::restore(store.root(), &record, &paths, force)?;
-            println!("restored snapshot {} into {}", record.id, record.repo);
-            if let Some(b) = backup {
-                println!(
-                    "previous state saved as snapshot {} (`brakeline restore {}` to undo)",
-                    b.id, b.id
-                );
-            }
+            println!("{}", restore_summary(&record, backup.as_ref()));
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Prune { keep } => {
@@ -384,6 +378,27 @@ fn run_hook(format: HookFormat, infer_failures: bool) -> Result<ExitCode> {
         eprintln!("{stderr}");
     }
     Ok(ExitCode::from(code as u8))
+}
+
+/// What `restore --yes` prints once the files are written.
+fn restore_summary(
+    record: &snapshot::SnapshotRecord,
+    backup: Option<&snapshot::SnapshotRecord>,
+) -> String {
+    let mut out = format!("restored snapshot {} into {}", record.id, record.repo);
+    if let Some(b) = backup {
+        out.push_str(&format!(
+            "\nprevious state saved as snapshot {} (`brakeline restore {}` to undo)",
+            b.id, b.id
+        ));
+        if let Some(note) = b.uncovered_note() {
+            out.push_str(&format!(
+                "\nthe undo snapshot {note} (see `brakeline restore {}`); undoing cannot bring those back.",
+                b.id
+            ));
+        }
+    }
+    out
 }
 
 fn ago(ts: u64) -> String {
@@ -490,6 +505,40 @@ mod tests {
         assert_eq!(
             hook_notice(&notices, Some(&err)).as_deref(),
             Some("project config ignored\nbrakeline state unavailable: read-only home")
+        );
+    }
+
+    #[test]
+    fn restore_summary_says_what_the_undo_snapshot_left_out() {
+        let record = snapshot::SnapshotRecord {
+            id: "1".into(),
+            repo: "/r".into(),
+            commit: "c".into(),
+            session_id: "s".into(),
+            reason: "r".into(),
+            command: "rm".into(),
+            created_at: 0,
+            uncovered: Vec::new(),
+        };
+        let mut backup = snapshot::SnapshotRecord {
+            id: "2".into(),
+            ..record.clone()
+        };
+        assert_eq!(
+            restore_summary(&record, Some(&backup)),
+            "restored snapshot 1 into /r\nprevious state saved as snapshot 2 (`brakeline restore 2` to undo)"
+        );
+        backup.uncovered = vec!["vendor/big/: too large".into()];
+        let summary = restore_summary(&record, Some(&backup));
+        assert!(
+            summary.ends_with(
+                "\nthe undo snapshot not covered: vendor/big/ (see `brakeline restore 2`); undoing cannot bring those back."
+            ),
+            "{summary}"
+        );
+        assert_eq!(
+            restore_summary(&record, None),
+            "restored snapshot 1 into /r"
         );
     }
 }
