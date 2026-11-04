@@ -54,86 +54,497 @@ fn scan(command: &str, cfg: &ShellConfig, depth: usize, out: &mut Findings) {
     if cfg.block_catastrophic && compact.contains(":(){:|:&};:") {
         out.block("fork bomb".into());
     }
-    for segment in split_segments(command) {
-        analyze_segment(&segment, cfg, depth, out);
+    let (segments, too_deep) = tokenize(command);
+    if too_deep {
+        let reason = "command nests too deeply to check".to_string();
+        if cfg.block_catastrophic {
+            out.block(reason);
+        } else {
+            out.destructive(reason);
+        }
+    }
+    for segment in &segments {
+        analyze_segment(&segment.words, &segment.writes, cfg, depth, out);
     }
 }
 
 /// Splits a command line into simple commands, honoring quotes. Operators
-/// (`;`, `&&`, `||`, `|`, `&`, newlines, subshell and substitution markers)
-/// all start a new segment.
+/// (`;`, `&&`, `||`, `|`, `&`, newlines, subshell parentheses) all start a
+/// new segment. Each `$(...)`, backtick or `<(...)` substitution becomes
+/// segments of its own and leaves its source text as one word in place.
+/// Comments, heredoc bodies and redirections are dropped.
 pub fn split_segments(input: &str) -> Vec<Vec<String>> {
-    let mut segments = Vec::new();
-    let mut words: Vec<String> = Vec::new();
-    let mut word = String::new();
-    let mut in_word = false;
-    let mut chars = input.chars().peekable();
+    tokenize(input)
+        .0
+        .into_iter()
+        .map(|s| s.words)
+        .filter(|w| !w.is_empty())
+        .collect()
+}
 
-    let flush_word = |word: &mut String, in_word: &mut bool, words: &mut Vec<String>| {
-        if *in_word {
-            words.push(std::mem::take(word));
-            *in_word = false;
+/// A simple command: its words, minus redirections, and the files its
+/// output redirections write to, as (truncates, target).
+#[derive(Debug, Default)]
+struct Segment {
+    words: Vec<String>,
+    writes: Vec<(bool, String)>,
+}
+
+/// Nesting of substitutions, quotes and arithmetic the lexer follows before
+/// giving up on the command. Keeps the recursion far from the stack limit.
+const MAX_LEX_DEPTH: usize = 64;
+
+/// Arithmetic `((`/`$((` guesses that may fail before the lexer stops
+/// trying, so adversarial input stays linear-ish.
+const MAX_ARITH_MISSES: usize = 64;
+
+/// Returns the segments and whether the command nested too deeply to read.
+fn tokenize(input: &str) -> (Vec<Segment>, bool) {
+    let mut lexer = Lexer::new(input, 0);
+    lexer.parse_list(false);
+    (lexer.segments, lexer.too_deep)
+}
+
+struct Heredoc {
+    delimiter: String,
+    strip_tabs: bool,
+    /// A quoted delimiter turns off expansion in the body.
+    quoted: bool,
+}
+
+struct Lexer {
+    chars: Vec<char>,
+    pos: usize,
+    depth: usize,
+    segments: Vec<Segment>,
+    heredocs: Vec<Heredoc>,
+    too_deep: bool,
+    arith_misses: usize,
+}
+
+fn is_metachar(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>')
+}
+
+impl Lexer {
+    fn new(input: &str, depth: usize) -> Self {
+        Lexer {
+            chars: input.chars().collect(),
+            pos: 0,
+            depth,
+            segments: Vec::new(),
+            heredocs: Vec::new(),
+            too_deep: false,
+            arith_misses: 0,
         }
-    };
+    }
 
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' => {
-                in_word = true;
-                for q in chars.by_ref() {
-                    if q == '\'' {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn peek_at(&self, n: usize) -> Option<char> {
+        self.chars.get(self.pos + n).copied()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek()?;
+        self.pos += 1;
+        Some(c)
+    }
+
+    fn source(&self, start: usize) -> String {
+        self.chars[start..self.pos].iter().collect()
+    }
+
+    fn give_up(&mut self) {
+        self.too_deep = true;
+        self.pos = self.chars.len();
+    }
+
+    /// Runs `f` on a fresh lexer over `text`, one level deeper, and keeps
+    /// the segments it finds.
+    fn sub(&mut self, text: &str, f: impl FnOnce(&mut Lexer)) {
+        if self.depth >= MAX_LEX_DEPTH {
+            self.give_up();
+            return;
+        }
+        let mut sub = Lexer::new(text, self.depth + 1);
+        f(&mut sub);
+        self.segments.append(&mut sub.segments);
+        if sub.too_deep {
+            self.give_up();
+        }
+    }
+
+    /// Finds the `))` closing an arithmetic expression whose body starts at
+    /// `start`. `None` means it is not arithmetic after all (bash then reads
+    /// `((` as nested subshells and `$((` as a command substitution).
+    fn arith_end(&mut self, start: usize) -> Option<usize> {
+        if self.arith_misses >= MAX_ARITH_MISSES {
+            return None;
+        }
+        let mut depth = 0usize;
+        let mut i = start;
+        while let Some(&c) = self.chars.get(i) {
+            match c {
+                '(' => depth += 1,
+                ')' if depth > 0 => depth -= 1,
+                ')' => {
+                    if self.chars.get(i + 1) == Some(&')') {
+                        return Some(i);
+                    }
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        self.arith_misses += 1;
+        None
+    }
+
+    /// Reads commands until the end of input, or, inside a substitution,
+    /// until its closing `)`.
+    fn parse_list(&mut self, in_subst: bool) {
+        if self.depth >= MAX_LEX_DEPTH {
+            self.give_up();
+            return;
+        }
+        self.depth += 1;
+        let mut cur = Segment::default();
+        let mut parens = 0usize;
+        let mut cases = 0usize;
+        while let Some(c) = self.peek() {
+            match c {
+                '\n' => {
+                    self.pos += 1;
+                    self.end_segment(&mut cur);
+                    self.read_heredocs();
+                }
+                c if c.is_whitespace() => self.pos += 1,
+                ';' | '|' => {
+                    self.pos += 1;
+                    self.end_segment(&mut cur);
+                }
+                '&' if self.peek_at(1) == Some('>') => {
+                    self.pos += 1;
+                    self.redirect(&mut cur, true);
+                }
+                '&' => {
+                    self.pos += 1;
+                    self.end_segment(&mut cur);
+                }
+                '(' => {
+                    let arith = (cur.words.is_empty() && self.peek_at(1) == Some('('))
+                        .then(|| self.arith_end(self.pos + 2))
+                        .flatten();
+                    self.end_segment(&mut cur);
+                    if let Some(end) = arith {
+                        let body: String = self.chars[self.pos + 2..end].iter().collect();
+                        self.pos = end + 2;
+                        self.sub(&body, |l| l.expansions(&mut String::new(), None));
+                    } else {
+                        self.pos += 1;
+                        parens += 1;
+                    }
+                }
+                ')' => {
+                    self.pos += 1;
+                    self.end_segment(&mut cur);
+                    if parens > 0 {
+                        parens -= 1;
+                    } else if in_subst && cases == 0 {
                         break;
                     }
-                    word.push(q);
+                }
+                '#' => {
+                    while self.peek().is_some_and(|c| c != '\n') {
+                        self.pos += 1;
+                    }
+                }
+                '<' | '>' => self.redirect(&mut cur, false),
+                _ => {
+                    let Some((word, quoted)) = self.read_word() else {
+                        continue;
+                    };
+                    if !quoted
+                        && !word.is_empty()
+                        && word.chars().all(|c| c.is_ascii_digit())
+                        && matches!(self.peek(), Some('<' | '>'))
+                    {
+                        self.redirect(&mut cur, false);
+                        continue;
+                    }
+                    if cur.words.is_empty() && !quoted {
+                        match word.as_str() {
+                            "case" => cases += 1,
+                            "esac" => cases = cases.saturating_sub(1),
+                            _ => {}
+                        }
+                    }
+                    cur.words.push(word);
                 }
             }
-            '"' => {
-                in_word = true;
-                while let Some(q) = chars.next() {
+        }
+        self.end_segment(&mut cur);
+        self.depth -= 1;
+    }
+
+    fn end_segment(&mut self, cur: &mut Segment) {
+        if !cur.words.is_empty() || !cur.writes.is_empty() {
+            self.segments.push(std::mem::take(cur));
+        }
+    }
+
+    /// Reads one shell word, removing quotes. `quoted` reports whether any
+    /// part of it was quoted or escaped. `None` if nothing but line
+    /// continuations was there.
+    fn read_word(&mut self) -> Option<(String, bool)> {
+        let mut word = String::new();
+        let mut in_word = false;
+        let mut quoted = false;
+        while let Some(c) = self.peek() {
+            if is_metachar(c) {
+                break;
+            }
+            self.pos += 1;
+            match c {
+                '\'' => {
+                    in_word = true;
+                    quoted = true;
+                    while let Some(q) = self.bump() {
+                        if q == '\'' {
+                            break;
+                        }
+                        word.push(q);
+                    }
+                }
+                '"' => {
+                    in_word = true;
+                    quoted = true;
+                    self.expansions(&mut word, Some('"'));
+                }
+                '\\' => match self.bump() {
+                    Some('\n') | None => {}
+                    Some(n) => {
+                        in_word = true;
+                        quoted = true;
+                        word.push(n);
+                    }
+                },
+                '$' => {
+                    in_word = true;
+                    self.dollar(&mut word, false);
+                }
+                '`' => {
+                    in_word = true;
+                    self.backtick(&mut word);
+                }
+                c => {
+                    in_word = true;
+                    word.push(c);
+                }
+            }
+        }
+        in_word.then_some((word, quoted))
+    }
+
+    /// Double-quote rules: only `$`, backticks and a few escapes are
+    /// special. Stops after `terminator`, or reads to the end (heredoc
+    /// bodies, arithmetic).
+    fn expansions(&mut self, word: &mut String, terminator: Option<char>) {
+        if self.depth >= MAX_LEX_DEPTH {
+            self.give_up();
+            return;
+        }
+        self.depth += 1;
+        while let Some(c) = self.bump() {
+            match c {
+                c if Some(c) == terminator => break,
+                '\\' => match self.peek() {
+                    Some('\n') => self.pos += 1,
+                    Some(n @ ('$' | '`' | '"' | '\\')) => {
+                        self.pos += 1;
+                        word.push(n);
+                    }
+                    _ => word.push('\\'),
+                },
+                '$' => self.dollar(word, true),
+                '`' => self.backtick(word),
+                c => word.push(c),
+            }
+        }
+        self.depth -= 1;
+    }
+
+    /// After a `$`: command substitution, arithmetic, ANSI-C quoting, or a
+    /// plain `$`.
+    fn dollar(&mut self, word: &mut String, in_double_quotes: bool) {
+        let start = self.pos - 1;
+        match self.peek() {
+            Some('(') => {
+                if self.peek_at(1) == Some('(')
+                    && let Some(end) = self.arith_end(self.pos + 2)
+                {
+                    let body: String = self.chars[self.pos + 2..end].iter().collect();
+                    self.pos = end + 2;
+                    self.sub(&body, |l| l.expansions(&mut String::new(), None));
+                } else {
+                    self.pos += 1;
+                    self.parse_list(true);
+                }
+                word.push_str(&self.source(start));
+            }
+            Some('\'') if !in_double_quotes => {
+                self.pos += 1;
+                while let Some(q) = self.bump() {
                     match q {
-                        '"' => break,
+                        '\'' => break,
                         '\\' => {
-                            if let Some(n) = chars.next() {
+                            if let Some(n) = self.bump() {
                                 word.push(n);
                             }
                         }
-                        _ => word.push(q),
+                        q => word.push(q),
                     }
                 }
             }
-            '\\' => {
-                in_word = true;
-                if let Some(n) = chars.next()
-                    && n != '\n'
-                {
-                    word.push(n);
+            _ => word.push('$'),
+        }
+    }
+
+    /// After an opening backtick: the command up to the closing one.
+    fn backtick(&mut self, word: &mut String) {
+        let start = self.pos - 1;
+        let mut inner = String::new();
+        while let Some(c) = self.bump() {
+            match c {
+                '`' => break,
+                '\\' => match self.peek() {
+                    Some(n @ ('`' | '\\' | '$')) => {
+                        self.pos += 1;
+                        inner.push(n);
+                    }
+                    _ => inner.push('\\'),
+                },
+                c => inner.push(c),
+            }
+        }
+        self.sub(&inner, |l| l.parse_list(false));
+        word.push_str(&self.source(start));
+    }
+
+    /// At `<` or `>` (after `&` for `&>`): records file writes, consumes the
+    /// target, and queues heredocs.
+    fn redirect(&mut self, cur: &mut Segment, both: bool) {
+        let Some(op) = self.bump() else { return };
+        if op == '<' {
+            match self.peek() {
+                Some('<') if self.peek_at(1) == Some('<') => {
+                    self.pos += 2;
+                    self.redirect_target();
+                }
+                Some('<') => {
+                    self.pos += 1;
+                    let strip_tabs = self.peek() == Some('-');
+                    if strip_tabs {
+                        self.pos += 1;
+                    }
+                    if let Some((delimiter, quoted)) = self.redirect_word() {
+                        self.heredocs.push(Heredoc {
+                            delimiter,
+                            strip_tabs,
+                            quoted,
+                        });
+                    }
+                }
+                Some('(') => cur.words.push(self.process_substitution()),
+                Some('&' | '>') => {
+                    self.pos += 1;
+                    self.redirect_target();
+                }
+                _ => {
+                    self.redirect_target();
                 }
             }
-            ';' | '&' | '|' | '\n' | '(' | ')' | '`' => {
-                flush_word(&mut word, &mut in_word, &mut words);
-                if !words.is_empty() {
-                    segments.push(std::mem::take(&mut words));
-                }
+            return;
+        }
+        let mut truncates = true;
+        let mut dup = false;
+        match self.peek() {
+            Some('>') => {
+                self.pos += 1;
+                truncates = false;
             }
-            '$' if chars.peek() == Some(&'(') => {
-                flush_word(&mut word, &mut in_word, &mut words);
-                if !words.is_empty() {
-                    segments.push(std::mem::take(&mut words));
-                }
-                chars.next();
+            Some('|') => self.pos += 1,
+            Some('&') if !both => {
+                self.pos += 1;
+                dup = true;
             }
-            c if c.is_whitespace() => flush_word(&mut word, &mut in_word, &mut words),
-            _ => {
-                in_word = true;
-                word.push(c);
+            Some('(') if !both => {
+                cur.words.push(self.process_substitution());
+                return;
+            }
+            _ => {}
+        }
+        if let Some(target) = self.redirect_target() {
+            let fd = target == "-" || target.chars().all(|c| c.is_ascii_digit());
+            if !(dup && fd) {
+                cur.writes.push((truncates, target));
             }
         }
     }
-    flush_word(&mut word, &mut in_word, &mut words);
-    if !words.is_empty() {
-        segments.push(words);
+
+    fn redirect_word(&mut self) -> Option<(String, bool)> {
+        while self.peek().is_some_and(|c| c == ' ' || c == '\t') {
+            self.pos += 1;
+        }
+        if self.peek().is_none_or(is_metachar) {
+            return None;
+        }
+        self.read_word()
     }
-    segments
+
+    fn redirect_target(&mut self) -> Option<String> {
+        self.redirect_word().map(|(w, _)| w)
+    }
+
+    /// At the `(` of `<(...)` or `>(...)`.
+    fn process_substitution(&mut self) -> String {
+        let start = self.pos - 1;
+        self.pos += 1;
+        self.parse_list(true);
+        self.source(start)
+    }
+
+    /// Consumes the bodies of the heredocs queued on the line just ended.
+    fn read_heredocs(&mut self) {
+        for doc in std::mem::take(&mut self.heredocs) {
+            let mut body = String::new();
+            while self.pos < self.chars.len() {
+                let end = self.chars[self.pos..]
+                    .iter()
+                    .position(|&c| c == '\n')
+                    .map_or(self.chars.len(), |p| self.pos + p);
+                let line: String = self.chars[self.pos..end].iter().collect();
+                self.pos = (end + 1).min(self.chars.len());
+                let candidate = if doc.strip_tabs {
+                    line.trim_start_matches('\t')
+                } else {
+                    line.as_str()
+                };
+                if candidate == doc.delimiter {
+                    break;
+                }
+                body.push_str(&line);
+                body.push('\n');
+            }
+            if !doc.quoted {
+                self.sub(&body, |l| l.expansions(&mut String::new(), None));
+            }
+        }
+    }
 }
 
 fn basename(word: &str) -> &str {
@@ -385,28 +796,6 @@ fn strip_once(words: &[String]) -> Strip {
     Strip::ProgramAt(i.min(words.len()))
 }
 
-/// Output redirections in a segment as (truncates, target).
-fn redirections(segment: &[String]) -> Vec<(bool, &str)> {
-    let mut out = Vec::new();
-    for (i, word) in segment.iter().enumerate() {
-        let w = word.trim_start_matches(|c: char| c.is_ascii_digit());
-        if !w.starts_with('>') {
-            continue;
-        }
-        let append = w.starts_with(">>");
-        let inline = w.trim_start_matches('>').trim_start_matches('|');
-        let target = if inline.is_empty() {
-            segment.get(i + 1).map(String::as_str).unwrap_or("")
-        } else {
-            inline
-        };
-        if !target.is_empty() && !target.starts_with('&') {
-            out.push((!append, target));
-        }
-    }
-    out
-}
-
 /// Redirect targets whose contents nobody needs back.
 fn is_scratch_target(target: &str) -> bool {
     target.starts_with("/dev/")
@@ -415,9 +804,15 @@ fn is_scratch_target(target: &str) -> bool {
             .any(|p| target.starts_with(p))
 }
 
-fn analyze_segment(segment: &[String], cfg: &ShellConfig, depth: usize, out: &mut Findings) {
-    if let Some((_, target)) = redirections(segment)
-        .into_iter()
+fn analyze_segment(
+    segment: &[String],
+    writes: &[(bool, String)],
+    cfg: &ShellConfig,
+    depth: usize,
+    out: &mut Findings,
+) {
+    if let Some((_, target)) = writes
+        .iter()
         .find(|(truncates, t)| *truncates && !is_scratch_target(t))
     {
         out.destructive(format!("`> {target}` overwrites the file"));
@@ -507,11 +902,9 @@ pub fn mutates(command: &str) -> bool {
     ) {
         return true;
     }
-    split_segments(command).iter().any(|segment| {
-        let redirects = redirections(segment)
-            .iter()
-            .any(|(_, t)| !t.starts_with("/dev/"));
-        let words = strip_wrappers(segment);
+    tokenize(command).0.iter().any(|segment| {
+        let redirects = segment.writes.iter().any(|(_, t)| !t.starts_with("/dev/"));
+        let words = strip_wrappers(&segment.words);
         let program = words.first().map(|w| basename(w)).unwrap_or("");
         let sub = words.get(1).map(String::as_str).unwrap_or("");
         redirects
@@ -599,7 +992,13 @@ fn analyze_find(args: &[String], cfg: &ShellConfig, depth: usize, out: &mut Find
                 .position(|w| w == ";" || w == "+")
                 .map_or(args.len(), |p| start + p);
             if depth < MAX_NESTING {
-                analyze_segment(&args[start..end], cfg, depth + 1, &mut payload_findings);
+                analyze_segment(
+                    &args[start..end],
+                    &[],
+                    cfg,
+                    depth + 1,
+                    &mut payload_findings,
+                );
             }
             i = end;
         }
@@ -1118,5 +1517,201 @@ mod tests {
                 vec!["cat".to_string()],
             ]
         );
+    }
+
+    fn safe(cmd: &str) -> bool {
+        classify(cmd, &cfg()) == Verdict::Safe
+    }
+
+    #[test]
+    fn line_continuations_join_words() {
+        assert!(blocked("cd build && \\\n  rm -rf ~"));
+        assert!(blocked("sudo \\\n rm -rf /"));
+        assert!(blocked("rm -rf \\\n/"));
+        assert!(blocked("echo \"a\\\nb\"; rm -rf ~"));
+        assert_eq!(
+            split_segments("cargo \\\n  test"),
+            vec![vec!["cargo".to_string(), "test".to_string()]]
+        );
+    }
+
+    #[test]
+    fn comments_are_skipped() {
+        assert!(blocked("# Let's clean up\nrm -rf ~/\necho 'done'"));
+        assert!(safe("cargo test # cleanup; rm -rf /"));
+        assert!(safe("# rm -rf ~"));
+        // `#` inside a word is not a comment.
+        assert!(blocked("echo a#b; rm -rf ~"));
+        assert!(blocked("echo ${#x}; rm -rf ~"));
+        assert!(blocked("echo \"#\"; rm -rf ~"));
+    }
+
+    #[test]
+    fn heredoc_bodies_are_data() {
+        assert!(blocked("cat > /tmp/a.txt <<EOF\nIt's fine\nEOF\nrm -rf ~"));
+        assert!(blocked("cat <<-'EOF' > /tmp/a\n\tIt's\n\tEOF\nrm -rf ~"));
+        assert!(blocked("cat <<\"EOF\" > /tmp/a\nIt's\nEOF\nrm -rf ~"));
+        assert!(blocked("cat <<\\EOF > /tmp/a\nIt's\nEOF\nrm -rf ~"));
+        assert!(blocked("cat <<A - /dev/stdin <<B\nx'\nA\ny'\nB\nrm -rf ~"));
+        // The file a heredoc overwrites still counts; its body does not.
+        assert_eq!(
+            classify(
+                "cat > scripts/clean.sh <<'EOF'\n#!/bin/sh\nrm -rf \"$OUT_DIR\"/*\nEOF",
+                &cfg()
+            ),
+            Verdict::Destructive("`> scripts/clean.sh` overwrites the file".into())
+        );
+        assert!(safe(
+            "cat > /tmp/notes.md <<'EOF'\ngit push --force origin main\nEOF"
+        ));
+        assert!(safe("git commit -F- <<'EOF'\nrm -rf ~\nEOF"));
+        // An unquoted delimiter still expands substitutions in the body.
+        assert!(blocked("cat > /tmp/a <<EOF\n$(rm -rf ~)\nEOF"));
+        assert!(blocked("cat > /tmp/a <<EOF\n`rm -rf ~`\nEOF"));
+        assert!(safe("cat > /tmp/a <<'EOF'\n$(rm -rf ~)\nEOF"));
+        assert!(safe("cat > /tmp/a <<EOF\n\\$(rm -rf ~)\nEOF"));
+        // A heredoc inside a substitution.
+        assert!(blocked("msg=$(cat <<'EOF'\nIt's\nEOF\n); rm -rf ~"));
+        // Unterminated: the shell reads the body to the end, and so do we.
+        assert!(safe("cat > /tmp/a <<EOF\nrm -rf ~"));
+        // Shifts in arithmetic are not heredocs.
+        assert!(blocked("(( x = 1 << 2 ))\nrm -rf ~"));
+        assert!(blocked("echo $(( 1 << 2 ))\nrm -rf ~"));
+        assert!(blocked("(( $(rm -rf ~) ))"));
+        assert!(blocked("((cd x; rm -rf ~) )"));
+        // Here-strings are one word, not a heredoc.
+        assert!(blocked("cat <<< \"it's\"; rm -rf ~"));
+    }
+
+    #[test]
+    fn substitutions_are_judged_wherever_they_appear() {
+        assert!(blocked("echo \"$(rm -rf ~)\""));
+        assert!(blocked("echo \"`rm -rf ~`\""));
+        assert!(destructive("out=\"$(git reset --hard origin/main 2>&1)\""));
+        assert!(blocked("rm -rf $(git rev-parse --show-toplevel) ~"));
+        assert!(blocked("chmod -R 777 $(whoami) ~"));
+        assert!(blocked("echo \"$(echo \")\"; rm -rf ~)\""));
+        assert!(blocked("diff <(ls) <(rm -rf ~)"));
+        assert!(blocked("tee >(rm -rf ~) < /dev/null"));
+        assert!(blocked("x=$(echo $(rm -rf ~))"));
+        assert!(blocked("x=$( (cd a; ls) ; rm -rf ~)"));
+        assert!(blocked("echo \"$(case $x in a) rm -rf ~;; esac)\""));
+        assert!(blocked("echo `echo \\`rm -rf ~\\``"));
+        assert!(safe("echo \"\\$(rm -rf ~)\""));
+        assert!(safe("echo '$(rm -rf ~)'"));
+        assert!(safe("git log --format=\"$(echo %H)\" | head"));
+        // ANSI-C quotes can hold an escaped quote.
+        assert!(blocked("echo $'it\\'s'; rm -rf ~"));
+        // The substitution stays one word of the outer command.
+        assert_eq!(
+            split_segments("rm -rf $(pwd) build"),
+            vec![
+                vec!["pwd".to_string()],
+                vec![
+                    "rm".to_string(),
+                    "-rf".to_string(),
+                    "$(pwd)".to_string(),
+                    "build".to_string()
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn redirect_operators_are_tokens() {
+        for cmd in [
+            "echo x >| src/main.rs",
+            "echo x >& src/main.rs",
+            "echo x >&src/main.rs",
+            "cmd &> out.log",
+            "cmd &>out.log",
+            "echo a>b",
+            "echo x 1> src/main.rs",
+        ] {
+            assert_eq!(
+                classify(cmd, &cfg()),
+                Verdict::Destructive(format!(
+                    "`> {}` overwrites the file",
+                    if cmd.contains("out.log") {
+                        "out.log"
+                    } else if cmd.ends_with("a>b") {
+                        "b"
+                    } else {
+                        "src/main.rs"
+                    }
+                )),
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            "cmd &>> out.log",
+            "cmd >&2",
+            "cmd 2>&1",
+            "cmd 2>&-",
+            "cmd &> /dev/null",
+            "echo a>/tmp/x",
+            "sort < in.txt",
+            "cmd 2>> err.log",
+        ] {
+            assert!(safe(cmd), "{cmd}");
+        }
+        assert!(mutates("cmd &>> out.log"));
+        assert!(!mutates("cmd >&2"));
+    }
+
+    #[test]
+    fn quoted_operators_are_not_redirects() {
+        for cmd in [
+            "grep -n \">\" src/main.rs",
+            "grep '>>' f",
+            "echo \"a > b\"",
+            "awk '$1 > 3' f",
+            "echo \\> f",
+        ] {
+            assert!(safe(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn hostile_input_does_not_panic() {
+        let deep = "$(".repeat(10_000);
+        let deep_quoted = "\"$(".repeat(10_000);
+        let deep_arith = "$((".repeat(10_000);
+        let parens = "((".repeat(5_000);
+        let ticks = "`\\`".repeat(5_000);
+        for cmd in [
+            "\\",
+            "a\\",
+            "'",
+            "\"",
+            "$(",
+            "$((",
+            "((",
+            "))",
+            "`",
+            "<<",
+            "<<-",
+            "cat <<EOF",
+            "cat <<'",
+            "$'",
+            "$'\\",
+            ">&",
+            "&>",
+            ">",
+            "<(",
+            "é$(ü) «»\u{feff}<<ß\nß",
+            "#",
+            "\n\n",
+            deep.as_str(),
+            deep_quoted.as_str(),
+            deep_arith.as_str(),
+            parens.as_str(),
+            ticks.as_str(),
+        ] {
+            let _ = classify(cmd, &cfg());
+            let _ = mutates(cmd);
+            let _ = split_segments(cmd);
+        }
+        assert!(blocked(&format!("{deep}rm -rf ~")));
     }
 }
