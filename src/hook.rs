@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::meter;
 use crate::shell::{self, Verdict};
 use crate::snapshot;
-use crate::state::{SessionState, Store, fingerprint, now_millis, now_secs};
+use crate::state::{GroupUse, SessionState, Store, fingerprint, now_millis, now_secs, sanitize_id};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HookInput {
@@ -168,24 +168,48 @@ impl Engine<'_> {
             if let Some(reason) = &s.halted {
                 return Ok((Outcome::Stop(format!("brakeline: this run is stopped: {reason} {}", reset_hint(id))), None));
             }
+            let mut group = None;
             if let Some(path) = &input.transcript_path
                 && !path.is_empty()
             {
                 // A metering failure must not block work; budgets just lag.
                 let path = Path::new(path);
                 if let Some(settings) = meter::droid_settings_path(path) {
+                    let mut own = None;
                     if let Ok(totals) = meter::read_droid_totals(&settings) {
                         meter::accumulate_droid(&mut s.usage_raw, &totals, cfg);
                         let now = meter::since(&s.usage_raw, &s.usage_baseline);
                         // Budgets only see use go up, even if Droid's
                         // counters restart.
                         s.usage = meter::at_least(&now, &s.usage);
+                        own = Some(totals.own);
+                    }
+                    let root = s
+                        .root
+                        .get_or_insert_with(|| droid_root(self.store, id, path))
+                        .clone();
+                    if let Some(own) = own {
+                        let me = GroupUse {
+                            factory_credits: own.factory_credits,
+                            output_tokens: own.output_tokens,
+                            tool_calls: s.tool_calls,
+                        };
+                        // An unsaved group must not block work: budgets
+                        // then fall back to this session alone.
+                        group = self
+                            .store
+                            .with_group(&root, |g| {
+                                g.members.insert(id.to_string(), me);
+                                (g.total(), g.members.len())
+                            })
+                            .ok();
                     }
                 } else {
                     let _ = meter::update(path, &mut s.transcript, &mut s.usage, cfg);
                 }
             }
-            if let Some(reason) = budget_exceeded(s, cfg) {
+            let group = group.as_ref();
+            if let Some(reason) = budget_exceeded(s, cfg, group) {
                 s.halted = Some(reason.clone());
                 return Ok((Outcome::Stop(format!("brakeline: {reason} {}", reset_hint(id))), None));
             }
@@ -223,7 +247,7 @@ impl Engine<'_> {
             if infer {
                 s.add_pending(fp, &name, now_ms);
             }
-            let warning = budget_warning(s, cfg);
+            let warning = budget_warning(s, cfg, group);
             let snap = match &verdict {
                 Verdict::Destructive(reason) if cfg.shell.snapshot_before_destructive => {
                     s.snapshots += 1;
@@ -321,6 +345,32 @@ fn unsaved_notice(outcome: Outcome, save_err: Option<anyhow::Error>) -> Outcome 
     }
 }
 
+/// The top of the chain of Droid sessions that spawned session `id`, by
+/// `callingSessionId`: a parent brakeline has seen already supplies its own
+/// root; otherwise the parent's transcript, next to this one, is read.
+fn droid_root(store: &Store, id: &str, transcript: &Path) -> String {
+    let Some(mut parent) = meter::droid_calling_session(transcript) else {
+        return id.to_string();
+    };
+    let dir = transcript.parent();
+    for _ in 0..16 {
+        if let Ok(Some(p)) = store.load(&parent)
+            && let Some(root) = p.root
+        {
+            return root;
+        }
+        // Only a plain id may name a file next to this transcript.
+        let next = dir
+            .filter(|_| sanitize_id(&parent) == parent)
+            .and_then(|d| meter::droid_calling_session(&d.join(format!("{parent}.jsonl"))));
+        match next {
+            Some(next) if next != parent && next != id => parent = next,
+            _ => break,
+        }
+    }
+    parent
+}
+
 /// A gap between hook events longer than this is idle time (the agent is
 /// waiting on the user, or the chat was resumed later) and does not count
 /// toward the session time budget. The cost: a single tool call that runs
@@ -399,15 +449,28 @@ struct BudgetUse {
     describe: String,
 }
 
-fn budget_uses(s: &SessionState, cfg: &Config) -> Vec<BudgetUse> {
+/// A session's use and, for a spawned group, the whole group's: (total since
+/// the last budget reset, number of sessions).
+type Group<'a> = Option<&'a (GroupUse, usize)>;
+
+/// The larger of a session's own count and its group's, and how to say it.
+fn widest(session: u64, group: Group, pick: fn(&GroupUse) -> u64) -> (u64, String) {
+    match group {
+        Some((g, n)) if *n > 1 && pick(g) > session => (pick(g), format!(" across {n} sessions")),
+        _ => (session, String::new()),
+    }
+}
+
+fn budget_uses(s: &SessionState, cfg: &Config, group: Group) -> Vec<BudgetUse> {
     let b = &cfg.budget;
     let mut out = Vec::new();
     if let Some(limit) = b.max_tool_calls {
+        let (used, across) = widest(s.tool_calls, group, |g| g.tool_calls);
         out.push(BudgetUse {
             name: "tool calls",
-            used: s.tool_calls as f64,
+            used: used as f64,
             limit: limit as f64,
-            describe: format!("{} of {limit} tool calls", s.tool_calls),
+            describe: format!("{used} of {limit} tool calls{across}"),
         });
     }
     if let Some(limit) = b.max_session_minutes {
@@ -428,33 +491,35 @@ fn budget_uses(s: &SessionState, cfg: &Config) -> Vec<BudgetUse> {
         });
     }
     if let Some(limit) = b.max_output_tokens {
+        let (used, across) = widest(s.usage.output_tokens, group, |g| g.output_tokens);
         out.push(BudgetUse {
             name: "output tokens",
-            used: s.usage.output_tokens as f64,
+            used: used as f64,
             limit: limit as f64,
-            describe: format!("{} of {limit} output tokens", s.usage.output_tokens),
+            describe: format!("{used} of {limit} output tokens{across}"),
         });
     }
     if let Some(limit) = b.max_factory_credits {
+        let (used, across) = widest(s.usage.factory_credits, group, |g| g.factory_credits);
         out.push(BudgetUse {
             name: "Factory credits",
-            used: s.usage.factory_credits as f64,
+            used: used as f64,
             limit: limit as f64,
-            describe: format!("{} of {limit} Factory credits", s.usage.factory_credits),
+            describe: format!("{used} of {limit} Factory credits{across}"),
         });
     }
     out
 }
 
-fn budget_exceeded(s: &SessionState, cfg: &Config) -> Option<String> {
-    budget_uses(s, cfg)
+fn budget_exceeded(s: &SessionState, cfg: &Config, group: Group) -> Option<String> {
+    budget_uses(s, cfg, group)
         .into_iter()
         .find(|u| u.used >= u.limit)
         .map(|u| format!("{} budget reached ({}).", u.name, u.describe))
 }
 
-fn budget_warning(s: &mut SessionState, cfg: &Config) -> Option<String> {
-    let crossing: Vec<BudgetUse> = budget_uses(s, cfg)
+fn budget_warning(s: &mut SessionState, cfg: &Config, group: Group) -> Option<String> {
+    let crossing: Vec<BudgetUse> = budget_uses(s, cfg, group)
         .into_iter()
         .filter(|u| u.used >= 0.8 * u.limit && !s.warned.iter().any(|w| w == u.name))
         .collect();
@@ -906,6 +971,81 @@ mod tests {
             "{}",
             s.usage.cost_usd
         );
+    }
+
+    #[test]
+    fn droid_mission_workers_share_one_credit_budget() {
+        let mut h = Harness::droid();
+        h.cfg.budget.max_factory_credits = Some(1_000);
+        let dir = h._dir.path().to_path_buf();
+        // An orchestrator, a worker it started, and a reviewer the worker
+        // started, as Droid writes them: the parent link in the first line,
+        // own and inclusive counters beside each transcript.
+        let session = |id: &str, parent: Option<&str>, own: u64, inclusive: u64| {
+            let mut start = json!({"type": "session_start", "id": id});
+            if let Some(p) = parent {
+                start["callingSessionId"] = json!(p);
+            }
+            std::fs::write(dir.join(format!("{id}.jsonl")), format!("{start}\n")).unwrap();
+            let body = json!({"model": "gpt-6.1-sol",
+                "tokenUsage": {"factoryCredits": own},
+                "inclusiveTokenUsage": {"factoryCredits": inclusive}});
+            std::fs::write(dir.join(format!("{id}.settings.json")), body.to_string()).unwrap();
+        };
+        let engine = Engine {
+            cfg: &h.cfg,
+            store: &h.store,
+            notice: None,
+            infer_failures: true,
+        };
+        let call = |id: &str, n: u32| {
+            engine.handle(&HookInput {
+                session_id: id.into(),
+                transcript_path: Some(
+                    dir.join(format!("{id}.jsonl"))
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                cwd: None,
+                hook_event_name: "PreToolUse".into(),
+                tool_name: Some("Read".into()),
+                tool_input: Some(json!({"file_path": format!("/{id}/{n}")})),
+                tool_response: None,
+            })
+        };
+        // The orchestrator's inclusive counter already holds its reviewer
+        // subagent; summing own counters must not count that twice.
+        session("orch", None, 100, 300);
+        session("worker", Some("orch"), 300, 300);
+        session("review", Some("worker"), 200, 200);
+        assert!(is_allow(&call("orch", 0)));
+        assert!(is_allow(&call("worker", 0)));
+        // 100 + 300 + 200 = 600: no warning yet, even together.
+        assert!(matches!(call("review", 0), Outcome::Allow(None)));
+        assert_eq!(
+            h.store.load("review").unwrap().unwrap().root.as_deref(),
+            Some("orch")
+        );
+        // The worker spends 300 more: 900 together, though no session
+        // alone is near 1,000.
+        session("worker", Some("orch"), 600, 600);
+        match call("worker", 1) {
+            Outcome::Allow(Some(m)) => assert!(
+                m.contains("900 of 1000 Factory credits across 3 sessions"),
+                "{m}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        session("worker", Some("orch"), 700, 700);
+        match call("worker", 2) {
+            Outcome::Stop(r) => assert!(
+                r.contains("1000 of 1000 Factory credits across 3 sessions"),
+                "{r}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        // The rest of the mission stops at its next call.
+        assert!(matches!(call("orch", 1), Outcome::Stop(_)));
     }
 
     #[test]

@@ -72,9 +72,31 @@ pub fn droid_settings_path(transcript: &Path) -> Option<std::path::PathBuf> {
 /// Droid's cumulative token counters and the model the session uses now.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DroidTotals {
-    /// Token counters and credits; `cost_usd` is always zero here.
+    /// Token counters and credits; `cost_usd` is always zero here. Includes
+    /// the subagents this session started.
     pub usage: Usage,
+    /// The same, for this session alone.
+    pub own: Usage,
     pub model: String,
+}
+
+/// The session that spawned the one writing `transcript` (Droid records it as
+/// `callingSessionId` in the transcript's first line), if any.
+pub fn droid_calling_session(transcript: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader, Read};
+    let file = std::fs::File::open(transcript).ok()?;
+    let mut line = String::new();
+    BufReader::new(file.take(256 * 1024))
+        .read_line(&mut line)
+        .ok()?;
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("session_start") {
+        return None;
+    }
+    v.get("callingSessionId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 /// Reads Droid's cumulative totals. They carry no cost: the file only names
@@ -85,14 +107,9 @@ pub fn read_droid_totals(settings: &Path) -> Result<DroidTotals> {
         .with_context(|| format!("cannot read {}", settings.display()))?;
     let v: Value = serde_json::from_str(&text)
         .with_context(|| format!("{} is not JSON", settings.display()))?;
-    let totals = v
-        .get("inclusiveTokenUsage")
-        .or_else(|| v.get("tokenUsage"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let n = |k: &str| totals.get(k).and_then(Value::as_u64).unwrap_or(0);
-    Ok(DroidTotals {
-        usage: Usage {
+    let read = |totals: &Value| {
+        let n = |k: &str| totals.get(k).and_then(Value::as_u64).unwrap_or(0);
+        Usage {
             input_tokens: n("inputTokens"),
             // Thinking tokens are billed as output.
             output_tokens: n("outputTokens") + n("thinkingTokens"),
@@ -100,7 +117,13 @@ pub fn read_droid_totals(settings: &Path) -> Result<DroidTotals> {
             cache_read_tokens: n("cacheReadTokens"),
             factory_credits: n("factoryCredits"),
             ..Usage::default()
-        },
+        }
+    };
+    let own = v.get("tokenUsage").or_else(|| v.get("inclusiveTokenUsage"));
+    let inclusive = v.get("inclusiveTokenUsage").or_else(|| v.get("tokenUsage"));
+    Ok(DroidTotals {
+        usage: read(inclusive.unwrap_or(&Value::Null)),
+        own: read(own.unwrap_or(&Value::Null)),
         model: v
             .get("model")
             .and_then(Value::as_str)
@@ -365,6 +388,7 @@ mod tests {
                 output_tokens: output,
                 ..Usage::default()
             },
+            own: Usage::default(),
             model: model.to_string(),
         };
         let mut raw = Usage::default();

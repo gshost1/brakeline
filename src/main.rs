@@ -440,6 +440,19 @@ fn status(session: Option<String>, json: bool) -> Result<ExitCode> {
             println!("last refusal {d}");
         }
         println!("snapshots    {}", s.snapshots);
+        if let Some(root) = &s.root
+            && let Some(g) = store.load_group(root)
+            && g.members.len() > 1
+        {
+            let t = g.total();
+            println!(
+                "group        {} sessions under {root}: {} tool calls, {} output tokens, {} Factory credits",
+                g.members.len(),
+                t.tool_calls,
+                t.output_tokens,
+                t.factory_credits
+            );
+        }
         let u = &s.usage;
         println!(
             "tokens       in {} / out {} / cache write {} / cache read {}",
