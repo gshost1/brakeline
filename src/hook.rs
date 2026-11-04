@@ -104,7 +104,7 @@ impl Engine<'_> {
             // At the end of a turn every call has finished; any still
             // pending never succeeded.
             "Stop" if self.infer_failures && !input.session_id.is_empty() => {
-                self.store.with_session(&input.session_id, |s| {
+                self.update(&input.session_id, |s| {
                     s.expire_pending(u64::MAX);
                     Ok(Outcome::Allow(None))
                 })
@@ -112,20 +112,25 @@ impl Engine<'_> {
             _ => Ok(Outcome::Allow(None)),
         };
         let outcome = outcome.unwrap_or_else(|err| self.fallback(input, &err));
-        let Some(notice) = &self.notice else {
-            return outcome;
-        };
-        match outcome {
-            Outcome::Allow(msg) => Outcome::Allow(Some(match msg {
-                Some(m) => format!("{notice}\n{m}"),
-                None => notice.clone(),
-            })),
-            Outcome::Deny(r) => Outcome::Deny(format!("{r}\n{notice}")),
-            Outcome::Stop(r) => Outcome::Stop(format!("{r}\n{notice}")),
+        match &self.notice {
+            Some(notice) => with_message(outcome, notice),
+            None => outcome,
         }
     }
 
-    /// State could not be read or written. Stateless protections still apply;
+    /// Runs `f` on the session state. If the state was read but cannot be
+    /// saved, the decision still stands and carries a notice: failing open
+    /// here would let a stopped run, a loop or a spent budget through.
+    fn update(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut SessionState) -> Result<Outcome>,
+    ) -> Result<Outcome> {
+        let (outcome, save_err) = self.store.update_session(id, f)?;
+        Ok(unsaved_notice(outcome, save_err))
+    }
+
+    /// State could not be read. Stateless protections still apply;
     /// everything else fails open so a broken guard never wedges the agent.
     fn fallback(&self, input: &HookInput, err: &anyhow::Error) -> Outcome {
         if input.hook_event_name == "PreToolUse" {
@@ -155,7 +160,7 @@ impl Engine<'_> {
         let id = input.session_id.as_str();
         let infer = self.infer_failures;
 
-        let (outcome, snapshot_reason) = self.store.with_session(id, |s| {
+        let ((outcome, snapshot_reason), save_err) = self.store.update_session(id, |s| {
             touch(s, input, now);
             if infer {
                 s.expire_pending(now_ms.saturating_sub(PENDING_GRACE_MS));
@@ -169,9 +174,12 @@ impl Engine<'_> {
                 // A metering failure must not block work; budgets just lag.
                 let path = Path::new(path);
                 if let Some(settings) = meter::droid_settings_path(path) {
-                    if let Ok(raw) = meter::read_droid_totals(&settings, cfg) {
-                        s.usage = meter::since(&raw, &s.usage_baseline);
-                        s.usage_raw = raw;
+                    if let Ok(totals) = meter::read_droid_totals(&settings) {
+                        meter::accumulate_droid(&mut s.usage_raw, &totals, cfg);
+                        let now = meter::since(&s.usage_raw, &s.usage_baseline);
+                        // Budgets only see use go up, even if Droid's
+                        // counters restart.
+                        s.usage = meter::at_least(&now, &s.usage);
                     }
                 } else {
                     let _ = meter::update(path, &mut s.transcript, &mut s.usage, cfg);
@@ -225,6 +233,7 @@ impl Engine<'_> {
             };
             Ok((Outcome::Allow(warning), snap))
         })?;
+        let outcome = unsaved_notice(outcome, save_err);
 
         // Snapshot outside the session lock: it can take a while on big repos
         // and must not stall parallel tool calls of the same session.
@@ -253,8 +262,7 @@ impl Engine<'_> {
             Err(err) => format!("brakeline: snapshot before {reason} failed: {err:#}"),
         };
         Ok(match outcome {
-            Outcome::Allow(Some(w)) => Outcome::Allow(Some(format!("{w}\n{message}"))),
-            Outcome::Allow(None) => Outcome::Allow(Some(message)),
+            Outcome::Allow(_) => with_message(outcome, &message),
             other => other,
         })
     }
@@ -269,7 +277,7 @@ impl Engine<'_> {
                 || shell_command(tool, &tool_input).is_some_and(shell::mutates));
         let name = label(tool, &tool_input);
         let now = now_secs();
-        self.store.with_session(&input.session_id, |s| {
+        self.update(&input.session_id, |s| {
             touch(s, input, now);
             s.resolve_pending(fp);
             if failed {
@@ -284,6 +292,26 @@ impl Engine<'_> {
             }
             Ok(Outcome::Allow(None))
         })
+    }
+}
+
+/// Appends `message` to whatever the outcome tells the user or agent.
+fn with_message(outcome: Outcome, message: &str) -> Outcome {
+    match outcome {
+        Outcome::Allow(Some(m)) => Outcome::Allow(Some(format!("{m}\n{message}"))),
+        Outcome::Allow(None) => Outcome::Allow(Some(message.to_string())),
+        Outcome::Deny(r) => Outcome::Deny(format!("{r}\n{message}")),
+        Outcome::Stop(r) => Outcome::Stop(format!("{r}\n{message}")),
+    }
+}
+
+fn unsaved_notice(outcome: Outcome, save_err: Option<anyhow::Error>) -> Outcome {
+    match save_err {
+        None => outcome,
+        Some(err) => with_message(
+            outcome,
+            &format!("brakeline could not save session state: {err:#}"),
+        ),
     }
 }
 
@@ -754,6 +782,108 @@ mod tests {
     }
 
     #[test]
+    fn droid_spend_does_not_drop_when_the_model_changes() {
+        let mut h = Harness::droid();
+        h.cfg.budget.max_cost_usd = Some(50.0);
+        let transcript = h._dir.path().join("abc.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let settings = h._dir.path().join("abc.settings.json");
+        let set = |model: &str, input: u64, output: u64| {
+            let body = json!({"model": model,
+                "inclusiveTokenUsage": {"inputTokens": input, "outputTokens": output}});
+            std::fs::write(&settings, body.to_string()).unwrap();
+        };
+        let engine = Engine {
+            cfg: &h.cfg,
+            store: &h.store,
+            notice: None,
+            infer_failures: true,
+        };
+        let call = |n: u32| {
+            engine.handle(&HookInput {
+                session_id: "sess".into(),
+                transcript_path: Some(transcript.to_string_lossy().into_owned()),
+                cwd: None,
+                hook_event_name: "PreToolUse".into(),
+                tool_name: Some("Read".into()),
+                tool_input: Some(json!({"file_path": format!("/f{n}")})),
+                tool_response: None,
+            })
+        };
+        // Opus: $5 + $42.50.
+        set("claude-opus-5", 1_000_000, 1_700_000);
+        match call(0) {
+            Outcome::Allow(Some(m)) => assert!(m.contains("$47.50"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        // One more million output tokens on Haiku adds $5, not a re-pricing
+        // of the whole session at Haiku rates.
+        set("claude-haiku-5", 1_000_000, 2_700_000);
+        match call(1) {
+            Outcome::Stop(r) => assert!(r.contains("$52.50"), "{r}"),
+            other => panic!("expected budget stop, got {other:?}"),
+        }
+        let s = h.store.load("sess").unwrap().unwrap();
+        assert!(
+            (s.usage.cost_usd - 52.5).abs() < 1e-9,
+            "{}",
+            s.usage.cost_usd
+        );
+    }
+
+    #[test]
+    fn droid_spend_after_budget_reset_counts_only_new_use() {
+        let mut h = Harness::droid();
+        h.cfg.budget.max_cost_usd = Some(50.0);
+        let transcript = h._dir.path().join("abc.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let settings = h._dir.path().join("abc.settings.json");
+        let set = |model: &str, output: u64| {
+            let body = json!({"model": model, "inclusiveTokenUsage": {"outputTokens": output}});
+            std::fs::write(&settings, body.to_string()).unwrap();
+        };
+        let call = |n: u32| {
+            Engine {
+                cfg: &h.cfg,
+                store: &h.store,
+                notice: None,
+                infer_failures: true,
+            }
+            .handle(&HookInput {
+                session_id: "sess".into(),
+                transcript_path: Some(transcript.to_string_lossy().into_owned()),
+                cwd: None,
+                hook_event_name: "PreToolUse".into(),
+                tool_name: Some("Read".into()),
+                tool_input: Some(json!({"file_path": format!("/f{n}")})),
+                tool_response: None,
+            })
+        };
+        set("claude-opus-5", 2_000_000);
+        assert!(matches!(call(0), Outcome::Stop(_)));
+        // What `brakeline reset --budget` does.
+        h.store
+            .with_session("sess", |s| {
+                s.halted = None;
+                s.usage = Default::default();
+                s.usage_baseline = s.usage_raw.clone();
+                s.warned.clear();
+                Ok(())
+            })
+            .unwrap();
+        // Switching to Haiku and adding 1M output costs $5 since the reset.
+        set("claude-haiku-5", 3_000_000);
+        assert!(is_allow(&call(1)));
+        let s = h.store.load("sess").unwrap().unwrap();
+        assert!(
+            (s.usage.cost_usd - 5.0).abs() < 1e-9,
+            "{}",
+            s.usage.cost_usd
+        );
+        assert_eq!(s.usage.output_tokens, 1_000_000);
+    }
+
+    #[test]
     fn droid_text_exit_code_is_parsed() {
         assert_eq!(text_exit_code("x\n[Process exited with code 0]"), Some(0));
         assert_eq!(
@@ -793,6 +923,93 @@ mod tests {
                 Some(json!({"success": true})),
             );
         }
+    }
+
+    /// Makes the session directory read-only for the guard's lifetime, so
+    /// state can still be read but not saved. Returns None where permissions
+    /// are not enforced (running as root), since the test would prove nothing.
+    #[cfg(unix)]
+    struct ReadOnly(PathBuf);
+
+    #[cfg(unix)]
+    impl ReadOnly {
+        fn new(dir: PathBuf) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let guard = Self(dir);
+            let probe = guard.0.join("probe");
+            if std::fs::write(&probe, b"x").is_ok() {
+                let _ = std::fs::remove_file(probe);
+                return None;
+            }
+            Some(guard)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ReadOnly {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsavable_state_keeps_a_stopped_run_stopped() {
+        let h = Harness::new();
+        let read = json!({"file_path": "/x/a.rs"});
+        while !matches!(h.pre("Read", read.clone()), Outcome::Stop(_)) {}
+        let Some(_ro) = ReadOnly::new(h.store.root().join("sessions")) else {
+            return;
+        };
+        match h.pre("Read", json!({"file_path": "/x/other.rs"})) {
+            Outcome::Stop(r) => assert!(r.contains("could not save"), "{r}"),
+            other => panic!("expected stop, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsavable_state_still_refuses_loops_and_budgets() {
+        let mut h = Harness::new();
+        h.cfg.budget.max_tool_calls = Some(6);
+        let read = json!({"file_path": "/x/a.rs"});
+        for _ in 0..5 {
+            assert!(is_allow(&h.pre("Read", read.clone())));
+        }
+        let Some(_ro) = ReadOnly::new(h.store.root().join("sessions")) else {
+            return;
+        };
+        assert!(matches!(h.pre("Read", read.clone()), Outcome::Deny(_)));
+        // The read-only state still holds 5 calls; budget 6 is not yet hit,
+        // but an allowed call still says its count could not be saved.
+        match h.pre("Read", json!({"file_path": "/x/b.rs"})) {
+            Outcome::Allow(Some(m)) => assert!(m.contains("could not save"), "{m}"),
+            other => panic!("expected allow with notice, got {other:?}"),
+        }
+        drop(_ro);
+        assert!(is_allow(&h.pre("Read", json!({"file_path": "/x/c.rs"}))));
+        let _ro = ReadOnly::new(h.store.root().join("sessions")).unwrap();
+        match h.pre("Read", json!({"file_path": "/x/d.rs"})) {
+            Outcome::Stop(r) => assert!(r.contains("tool calls budget reached"), "{r}"),
+            other => panic!("expected budget stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unreadable_state_fails_open_except_catastrophic() {
+        let h = Harness::new();
+        assert!(is_allow(&h.pre("Read", json!({"file_path": "/a"}))));
+        std::fs::write(h.store.root().join("sessions/sess.json"), "not json").unwrap();
+        match h.pre("Read", json!({"file_path": "/a"})) {
+            Outcome::Allow(Some(m)) => assert!(m.contains("brakeline error (allowing)"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            h.pre("Bash", json!({"command": "rm -rf ~/"})),
+            Outcome::Deny(_)
+        ));
     }
 
     #[test]
