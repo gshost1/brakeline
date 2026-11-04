@@ -671,13 +671,20 @@ fn snapshot_entries(
         args.extend(["--error-unmatch", "--"]);
         args.extend(paths.iter().map(String::as_str));
     }
-    let out = match git_raw(repo, &args, Some(&index.0), &[], None) {
-        Ok(out) => out,
-        Err(err) if err.to_string().contains("did not match") => {
+    let out = git_output(repo, &args, Some(&index.0), &[], None)?;
+    // --error-unmatch exits 1 for a pathspec that matches nothing; other
+    // failures exit 128. The status works in any locale, unlike the message.
+    match out.status.code() {
+        Some(0) => {}
+        Some(1) if !paths.is_empty() => {
             bail!("nothing in the snapshot matches: {}", paths.join(" "))
         }
-        Err(err) => return Err(err),
-    };
+        _ => bail!(
+            "git ls-files failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
+    let out = out.stdout;
     Ok(split_z(&out)
         .filter_map(|rec| {
             let tab = rec.iter().position(|b| *b == b'\t')?;
@@ -1532,6 +1539,86 @@ mod tests {
         assert!(!shown.diff.contains("f.txt"), "{}", shown.diff);
         assert_eq!(shown.uncovered.len(), 1, "{:?}", shown.uncovered);
         assert!(shown.uncovered[0].contains("d8/"), "{:?}", shown.uncovered);
+    }
+
+    /// Re-runs the test `name` in a child process with `env` added, so a
+    /// test can change git's environment without touching this process's.
+    /// Returns true in the child, which then runs the test body.
+    fn in_child(name: &str, env: &[(&str, &OsStr)]) -> bool {
+        const CHILD: &str = "BRAKELINE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("snapshot::tests::{name}"),
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        false
+    }
+
+    #[test]
+    fn unmatched_restore_paths_are_detected_in_any_locale() {
+        // German, when git's translation is installed.
+        let de = OsStr::new("de_DE.UTF-8");
+        if !in_child(
+            "unmatched_restore_paths_are_detected_in_any_locale",
+            &[("LC_ALL", de), ("LANG", de)],
+        ) {
+            return;
+        }
+        let repo = committed_repo(&[("a.txt", "a")]);
+        let data = tempfile::tempdir().unwrap();
+        let rec = take(data.path(), repo.path(), "s", "t", "rm")
+            .unwrap()
+            .unwrap();
+        let err = preview(data.path(), &rec, &["nope.txt".into()])
+            .err()
+            .unwrap();
+        assert!(
+            format!("{err:#}").contains("nothing in the snapshot matches"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn nested_walk_keeps_the_users_git_config_environment() {
+        let base = tempfile::tempdir().unwrap();
+        let excludes = base.path().join("excludes");
+        fs::write(&excludes, "*.private\n").unwrap();
+        if !in_child(
+            "nested_walk_keeps_the_users_git_config_environment",
+            &[
+                ("GIT_CONFIG_COUNT", OsStr::new("1")),
+                ("GIT_CONFIG_KEY_0", OsStr::new("core.excludesFile")),
+                ("GIT_CONFIG_VALUE_0", excludes.as_os_str()),
+            ],
+        ) {
+            return;
+        }
+        assert!(std::env::var_os("GIT_CONFIG_COUNT").is_some());
+        let repo = committed_repo(&[("a.txt", "a")]);
+        let data = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        let sub = r.join("sub");
+        fs::create_dir(&sub).unwrap();
+        sh(&sub, &["init", "-q"]);
+        fs::write(sub.join("notes.private"), "p").unwrap();
+        fs::write(sub.join("b.txt"), "b").unwrap();
+        let rec = take(data.path(), r, "s", "t", "rm").unwrap().unwrap();
+        assert!(in_tree(r, &rec.commit, "sub/b.txt"));
+        assert!(!in_tree(r, &rec.commit, "sub/notes.private"));
     }
 
     #[test]
