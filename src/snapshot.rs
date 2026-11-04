@@ -55,6 +55,10 @@ impl SnapshotRecord {
     }
 }
 
+fn os<'a>(args: &[&'a str]) -> Vec<&'a OsStr> {
+    args.iter().map(|a| OsStr::new(*a)).collect()
+}
+
 /// Runs git in `repo` and returns its raw stdout. `env` adds variables (such
 /// as `GIT_DIR`), and `input` is written to stdin.
 fn git_raw(
@@ -64,16 +68,29 @@ fn git_raw(
     env: &[(&str, &OsStr)],
     input: Option<Vec<u8>>,
 ) -> Result<Vec<u8>> {
-    let out = git_output(repo, args, index, env, input)?;
+    git_raw_os(repo, &os(args), index, env, input)
+}
+
+/// [`git_raw`] with arguments that need not be UTF-8, such as file paths.
+fn git_raw_os(
+    repo: &Path,
+    args: &[&OsStr],
+    index: Option<&Path>,
+    env: &[(&str, &OsStr)],
+    input: Option<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let out = git_output_os(repo, args, index, env, input)?;
     if !out.status.success() {
         // Name the subcommand, skipping `-c key=value` options before it.
         let mut rest = args;
-        while let ["-c", _, tail @ ..] = rest {
+        while let [c, _, tail @ ..] = rest
+            && *c == "-c"
+        {
             rest = tail;
         }
         bail!(
             "git {} failed: {}",
-            rest.first().copied().unwrap_or(""),
+            rest.first().map_or("".into(), |a| a.to_string_lossy()),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -84,6 +101,16 @@ fn git_raw(
 fn git_output(
     repo: &Path,
     args: &[&str],
+    index: Option<&Path>,
+    env: &[(&str, &OsStr)],
+    input: Option<Vec<u8>>,
+) -> Result<std::process::Output> {
+    git_output_os(repo, &os(args), index, env, input)
+}
+
+fn git_output_os(
+    repo: &Path,
+    args: &[&OsStr],
     index: Option<&Path>,
     env: &[(&str, &OsStr)],
     input: Option<Vec<u8>>,
@@ -214,6 +241,13 @@ fn fs_path(root: &Path, rel: &[u8]) -> PathBuf {
     {
         root.join(String::from_utf8_lossy(rel).as_ref())
     }
+}
+
+/// `--exclude-from=<path>` with the path's exact bytes.
+fn exclude_from_arg(path: &Path) -> std::ffi::OsString {
+    let mut arg = std::ffi::OsString::from("--exclude-from=");
+    arg.push(path.as_os_str());
+    arg
 }
 
 /// Whether `rel`, a path read from a nested repository (whose index may be
@@ -354,6 +388,10 @@ struct Walker<'a> {
     git_dir: PathBuf,
     uncovered: Vec<Uncovered>,
     limits: Limits,
+    /// The outermost untracked nested repository being walked, relative to
+    /// the outer root. Ignore rules from inside it are not the outer
+    /// repository's.
+    top: String,
     /// Files and bytes hashed from nested repositories so far.
     files: usize,
     bytes: u64,
@@ -429,13 +467,13 @@ impl Walker<'_> {
     fn nested_git(
         &self,
         dir: &Path,
-        args: &[&str],
+        args: &[&OsStr],
         index: &Path,
         input: Option<Vec<u8>>,
     ) -> Result<Vec<u8>> {
-        let mut full = vec!["-c", "core.fsmonitor=false"];
+        let mut full = os(&["-c", "core.fsmonitor=false"]);
         full.extend_from_slice(args);
-        git_raw(
+        git_raw_os(
             dir,
             &full,
             Some(index),
@@ -461,6 +499,9 @@ impl Walker<'_> {
         depth: usize,
     ) {
         let name = format!("{shown}{}", String::from_utf8_lossy(repo));
+        if depth == 0 {
+            self.top = name.clone();
+        }
         let result = (|| {
             let Ok(rel) = std::str::from_utf8(repo) else {
                 bail!("path is not valid UTF-8");
@@ -512,7 +553,7 @@ impl Walker<'_> {
         if !files.is_empty() {
             self.nested_git(
                 dir,
-                &["update-index", "--add", "-z", "--stdin"],
+                &os(&["update-index", "--add", "-z", "--stdin"]),
                 &index.0,
                 Some(join_z(files.iter().map(|f| f.path.as_slice()))),
             )?;
@@ -534,7 +575,7 @@ impl Walker<'_> {
         }
         Ok(text(self.nested_git(
             dir,
-            &["write-tree"],
+            &os(&["write-tree"]),
             &index.0,
             None,
         )?))
@@ -580,24 +621,30 @@ impl Walker<'_> {
             .as_ref()
             .map(|d| d.join("info/exclude"))
             .filter(|p| p.is_file())
-            .map(|p| format!("--exclude-from={}", p.display()));
-        let mut args = vec![
+            .map(|p| exclude_from_arg(&p));
+        let mut args = os(&[
             "ls-files",
             "-t",
             "-z",
             "--cached",
             "--others",
             "--exclude-per-directory=.gitignore",
-        ];
+        ]);
         if let Some(e) = &exclude {
             args.push(e);
         }
         let out = self.nested_git(dir, &args, &index, None)?;
         let mut found = Vec::new();
+        // An unmerged path is listed once per stage (--deduplicate does
+        // nothing with -t); count it once.
+        let mut seen = std::collections::HashSet::new();
         for rec in split_z(&out) {
             let (Some(&tag), Some(path)) = (rec.first(), rec.get(2..)) else {
                 continue;
             };
+            if !seen.insert(path) {
+                continue;
+            }
             let tracked = tag != b'?';
             let rel = path.strip_suffix(b"/").unwrap_or(path);
             if !safe_rel(dir, rel) {
@@ -660,14 +707,20 @@ impl Walker<'_> {
     /// For each of `found` inside the nested repository `name`, whether the
     /// rules of the repositories around it ignore it, as if it were a plain
     /// directory. `git check-ignore` from the outer root also reads the
-    /// nested repository's own `.gitignore` files; a match from those only
-    /// counts against untracked files (its tracked ones were kept on purpose).
+    /// `.gitignore` files of every nested repository on the way; a match from
+    /// those only counts against untracked files. A tracked file was kept on
+    /// purpose, so only the real outer repository's rules (from outside the
+    /// outermost nested repository) drop it.
     fn outer_ignored(&self, name: &str, found: &[Found]) -> Result<Vec<bool>> {
         if found.is_empty() {
             return Ok(Vec::new());
         }
         let mut query = Vec::new();
         for f in found {
+            // check-ignore parses each path as a pathspec and rejects
+            // `:(literal)` and --literal-pathspecs; a leading `./` keeps a
+            // name like `:!tmp` from reading as magic.
+            query.extend_from_slice(b"./");
             query.extend_from_slice(name.as_bytes());
             query.push(b'/');
             query.extend_from_slice(&f.path);
@@ -680,7 +733,6 @@ impl Walker<'_> {
             self.root,
             &["check-ignore", "-v", "-n", "-z", "--no-index", "--stdin"],
             None,
-            // Paths from stdin are taken literally (no pathspec magic).
             &[],
             Some(query),
         )?;
@@ -698,14 +750,14 @@ impl Walker<'_> {
         if records.len() != found.len() {
             bail!("unexpected git check-ignore output");
         }
-        let own = format!("{name}/");
+        let nested = format!("{}/", self.top);
         Ok(records
             .iter()
             .zip(found)
             .map(|(rec, f)| {
                 let (source, pattern) = (rec[0], rec[2]);
                 let ignored = !source.is_empty() && !pattern.starts_with(b"!");
-                ignored && !(f.tracked && source.starts_with(own.as_bytes()))
+                ignored && !(f.tracked && source.starts_with(nested.as_bytes()))
             })
             .collect())
     }
@@ -736,6 +788,7 @@ fn worktree_tree_limited(data_dir: &Path, root: &Path, tag: &str, limits: Limits
         git_dir: PathBuf::from(git(root, &["rev-parse", "--absolute-git-dir"], None)?),
         uncovered: Vec::new(),
         limits,
+        top: String::new(),
         files: 0,
         bytes: 0,
     };
@@ -797,7 +850,7 @@ fn snapshot_entries(
 /// Paths where the snapshot and the work tree disagree on file versus
 /// directory. `git restore --overlay` still replaces those, deleting the
 /// whole directory, ignored files included, so they are refused unless forced.
-fn type_conflicts(repo: &Path, entries: &[Entry]) -> Vec<String> {
+fn type_conflicts(repo: &Path, entries: &[&Entry]) -> Vec<String> {
     let mut conflicts = std::collections::BTreeSet::new();
     let mut parents = std::collections::BTreeSet::new();
     for entry in entries {
@@ -1017,10 +1070,124 @@ pub fn preview(data_dir: &Path, record: &SnapshotRecord, paths: &[String]) -> Re
     args.extend(paths.iter().map(String::as_str));
     args.extend(excludes.iter().map(String::as_str));
     let diff = git(repo, &args, None)?;
+    let plan = plan_restore(data_dir, repo, record, paths, entries)?;
     Ok(Preview {
         diff,
-        conflicts: type_conflicts(repo, &entries),
+        conflicts: plan.conflicts,
         uncovered: current.uncovered.iter().map(ToString::to_string).collect(),
+    })
+}
+
+/// What a restore of `paths` (everything when empty) writes.
+struct RestorePlan {
+    /// Paths that are a file on one side and a directory on the other.
+    conflicts: Vec<String>,
+    /// Pathspecs for the main `git restore`, which leaves skip-worktree
+    /// files alone. Each matches at least one file it will write: git fails
+    /// on a pathspec that matches nothing.
+    specs: Vec<String>,
+    /// Skip-worktree files the main pass must exclude: `git restore` writes
+    /// one whose index entry differs from the snapshot (it replaces the
+    /// entry, dropping the flag).
+    differs: Vec<Vec<u8>>,
+    /// Skip-worktree files written anyway: they held local work in the
+    /// snapshot, or the user named them exactly.
+    sparse_work: Vec<Vec<u8>>,
+}
+
+/// Plans a restore. Skip-worktree files (a sparse checkout's out-of-cone
+/// files, mostly) are written only when they held local work in the
+/// snapshot or are named exactly as files; naming a directory, or nothing,
+/// leaves the others alone.
+fn plan_restore(
+    data_dir: &Path,
+    repo: &Path,
+    record: &SnapshotRecord,
+    paths: &[String],
+    entries: Vec<Entry>,
+) -> Result<RestorePlan> {
+    use std::collections::HashSet;
+    let skip = flagged_paths(repo, None)?.skip_worktree;
+    let skip_set: HashSet<&[u8]> = skip.iter().map(Vec::as_slice).collect();
+    let in_snapshot: HashSet<&[u8]> = entries.iter().map(|e| e.path.as_slice()).collect();
+    let mut sparse_work = skip_worktree_to_restore(repo, record, &entries, &skip)?;
+    for p in paths {
+        let p = p.strip_prefix("./").unwrap_or(p).as_bytes();
+        if skip_set.contains(p) && in_snapshot.contains(p) && !sparse_work.iter().any(|w| w == p) {
+            sparse_work.push(p.to_vec());
+        }
+    }
+    let sparse_set: HashSet<&[u8]> = sparse_work.iter().map(Vec::as_slice).collect();
+    let written: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| !skip_set.contains(e.path.as_slice()) || sparse_set.contains(e.path.as_slice()))
+        .collect();
+    let conflicts = type_conflicts(repo, &written);
+
+    let differs: Vec<Vec<u8>> = if skip.is_empty() {
+        Vec::new()
+    } else {
+        let out = git_raw(
+            repo,
+            &[
+                "diff-index",
+                "--cached",
+                "--name-only",
+                "-z",
+                &record.commit,
+                "--",
+            ],
+            None,
+            &[],
+            None,
+        )?;
+        let changed: HashSet<&[u8]> = split_z(&out).collect();
+        skip.iter()
+            .filter(|p| changed.contains(p.as_slice()))
+            .cloned()
+            .collect()
+    };
+
+    // Keep the pathspecs that match a file outside the skip-worktree set.
+    let specs: Vec<&str> = if paths.is_empty() {
+        vec!["."]
+    } else {
+        paths.iter().map(String::as_str).collect()
+    };
+    let index = temp_index(data_dir, "specs")?;
+    git(repo, &["read-tree", &record.commit], Some(&index.0))?;
+    if !skip.is_empty() {
+        git_raw(
+            repo,
+            &["update-index", "--force-remove", "-z", "--stdin"],
+            Some(&index.0),
+            &[],
+            Some(join_z(skip.iter().map(Vec::as_slice))),
+        )?;
+    }
+    let mut kept = Vec::new();
+    for spec in specs {
+        let out = git_output(
+            repo,
+            &["ls-files", "--error-unmatch", "--", spec],
+            Some(&index.0),
+            &[],
+            None,
+        )?;
+        match out.status.code() {
+            Some(0) => kept.push(spec.to_string()),
+            Some(1) => {}
+            _ => bail!(
+                "git ls-files failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        }
+    }
+    Ok(RestorePlan {
+        conflicts,
+        specs: kept,
+        differs,
+        sparse_work,
     })
 }
 
@@ -1042,46 +1209,18 @@ pub fn restore(
     )
     .context("snapshot commit is missing (was it pruned?)")?;
     let entries = snapshot_entries(data_dir, repo, &record.commit, paths)?;
-    let conflicts = type_conflicts(repo, &entries);
+    let RestorePlan {
+        conflicts,
+        specs,
+        differs,
+        sparse_work,
+    } = plan_restore(data_dir, repo, record, paths, entries)?;
     if !conflicts.is_empty() && !force {
         bail!(
             "restoring would replace these paths and delete everything in them, ignored files included:\n  {}\nMove them aside, restore other paths, or re-run with --force.",
             conflicts.join("\n  ")
         );
     }
-    // `git restore -- .` writes a skip-worktree file whose index entry
-    // differs from the snapshot (it replaces the entry, dropping the flag).
-    // Those are kept out of a whole-tree restore, and the ones holding local
-    // work are restored separately.
-    let skip = if paths.is_empty() {
-        flagged_paths(repo, None)?.skip_worktree
-    } else {
-        Vec::new()
-    };
-    let sparse_work = skip_worktree_to_restore(repo, record, &entries, &skip)?;
-    let differs: Vec<Vec<u8>> = if skip.is_empty() {
-        Vec::new()
-    } else {
-        let out = git_raw(
-            repo,
-            &[
-                "diff-index",
-                "--cached",
-                "--name-only",
-                "-z",
-                &record.commit,
-                "--",
-            ],
-            None,
-            &[],
-            None,
-        )?;
-        let changed: std::collections::HashSet<&[u8]> = split_z(&out).collect();
-        skip.iter()
-            .filter(|p| changed.contains(p.as_slice()))
-            .cloned()
-            .collect()
-    };
     let backup = take(
         data_dir,
         repo,
@@ -1090,47 +1229,27 @@ pub fn restore(
         &format!("brakeline restore {}", record.id),
     )?;
     let source = format!("--source={}", record.commit);
-    if paths.is_empty() {
-        let skip_set: std::collections::HashSet<&[u8]> = skip.iter().map(Vec::as_slice).collect();
-        // git restore fails when the pathspec matches nothing, and it does
-        // not match skip-worktree entries.
-        let rest = entries
-            .iter()
-            .any(|e| !skip_set.contains(e.path.as_slice()));
-        let mut spec = b".\0".to_vec();
+    if !specs.is_empty() {
+        let mut spec = join_z(specs.iter().map(|s| s.as_bytes()));
         for p in &differs {
             spec.extend_from_slice(b":(exclude,literal)");
             spec.extend_from_slice(p);
             spec.push(0);
         }
-        if rest {
-            git_raw(
-                repo,
-                &[
-                    "restore",
-                    source.as_str(),
-                    "--worktree",
-                    "--overlay",
-                    "--pathspec-from-file=-",
-                    "--pathspec-file-nul",
-                ],
-                None,
-                &[],
-                Some(spec),
-            )?;
-        }
-    } else {
-        // Paths the user names are restored even if flagged skip-worktree.
-        let mut args = vec![
-            "restore",
-            source.as_str(),
-            "--worktree",
-            "--overlay",
-            "--ignore-skip-worktree-bits",
-            "--",
-        ];
-        args.extend(paths.iter().map(String::as_str));
-        git(repo, &args, None)?;
+        git_raw(
+            repo,
+            &[
+                "restore",
+                source.as_str(),
+                "--worktree",
+                "--overlay",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
+            None,
+            &[],
+            Some(spec),
+        )?;
     }
     if !sparse_work.is_empty() {
         git_raw(
@@ -1496,9 +1615,13 @@ mod tests {
     }
 
     fn in_tree(repo: &Path, commit: &str, path: &str) -> bool {
-        !git(repo, &["ls-tree", commit, "--", path], None)
-            .unwrap()
-            .is_empty()
+        !git(
+            repo,
+            &["--literal-pathspecs", "ls-tree", commit, "--", path],
+            None,
+        )
+        .unwrap()
+        .is_empty()
     }
 
     #[test]
@@ -1883,6 +2006,151 @@ mod tests {
             .filter(|u| u.contains("unsafe path"))
             .count();
         assert_eq!(unsafe_paths, 8, "{:?}", rec.uncovered);
+    }
+
+    #[test]
+    fn named_directories_leave_sparse_files_alone() {
+        let repo = committed_repo(&[("d/in.txt", "in"), ("d/out.txt", "out"), ("a.txt", "a")]);
+        let data = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        sh(r, &["update-index", "--skip-worktree", "d/out.txt"]);
+        fs::remove_file(r.join("d/out.txt")).unwrap();
+        let rec = take(data.path(), r, "s", "t", "rm").unwrap().unwrap();
+
+        for named in ["d", "."] {
+            fs::remove_file(r.join("d/in.txt")).unwrap();
+            restore(data.path(), &rec, &[named.into()], false).unwrap();
+            assert_eq!(fs::read_to_string(r.join("d/in.txt")).unwrap(), "in");
+            assert!(!r.join("d/out.txt").exists(), "restore -- {named}");
+        }
+        // A directory holding nothing but sparse files restores as a no-op.
+        sh(r, &["update-index", "--skip-worktree", "d/in.txt"]);
+        fs::remove_file(r.join("d/in.txt")).unwrap();
+        restore(data.path(), &rec, &["d".into()], false).unwrap();
+        assert!(!r.join("d/in.txt").exists());
+        // A file named exactly is restored.
+        restore(data.path(), &rec, &["d/out.txt".into()], false).unwrap();
+        assert_eq!(fs::read_to_string(r.join("d/out.txt")).unwrap(), "out");
+    }
+
+    #[test]
+    fn sparse_files_restore_leaves_out_do_not_count_as_conflicts() {
+        let repo = committed_repo(&[("s", "sparse"), ("a.txt", "a")]);
+        let data = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        sh(r, &["update-index", "--skip-worktree", "s"]);
+        fs::remove_file(r.join("s")).unwrap();
+        let rec = take(data.path(), r, "s", "t", "rm").unwrap().unwrap();
+        fs::create_dir(r.join("s")).unwrap();
+        fs::write(r.join("s/mine.txt"), "mine").unwrap();
+        fs::remove_file(r.join("a.txt")).unwrap();
+
+        assert!(
+            preview(data.path(), &rec, &[])
+                .unwrap()
+                .conflicts
+                .is_empty()
+        );
+        restore(data.path(), &rec, &[], false).unwrap();
+        assert_eq!(fs::read_to_string(r.join("a.txt")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(r.join("s/mine.txt")).unwrap(), "mine");
+    }
+
+    #[test]
+    fn files_tracked_by_a_deeper_repository_ignore_an_intermediate_ones_rules() {
+        let repo = committed_repo(&[(".gitignore", "*.tmp\n")]);
+        let data = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        let sub = r.join("sub");
+        let inner = sub.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        sh(&sub, &["init", "-q"]);
+        fs::write(sub.join(".gitignore"), "*.log\n").unwrap();
+        sh(&inner, &["init", "-q"]);
+        fs::write(inner.join("important.log"), "kept").unwrap();
+        fs::write(inner.join("tracked.tmp"), "outer rule").unwrap();
+        sh(&inner, &["add", "-f", "important.log", "tracked.tmp"]);
+        fs::write(inner.join("loose.log"), "untracked").unwrap();
+
+        let rec = take(data.path(), r, "s", "t", "rm").unwrap().unwrap();
+        assert!(rec.uncovered.is_empty(), "{:?}", rec.uncovered);
+        assert!(in_tree(r, &rec.commit, "sub/inner/important.log"));
+        assert!(
+            !in_tree(r, &rec.commit, "sub/inner/tracked.tmp"),
+            "outer rule"
+        );
+        assert!(!in_tree(r, &rec.commit, "sub/inner/loose.log"));
+    }
+
+    #[test]
+    fn nested_paths_that_look_like_pathspec_magic_are_snapshotted() {
+        let repo = committed_repo(&[("a.txt", "a")]);
+        let data = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        for name in [":!tmp", ":(x)"] {
+            let d = r.join(name);
+            fs::create_dir(&d).unwrap();
+            sh(&d, &["init", "-q"]);
+            fs::write(d.join("f.txt"), "f").unwrap();
+        }
+        let rec = take(data.path(), r, "s", "t", "rm").unwrap().unwrap();
+        assert!(rec.uncovered.is_empty(), "{:?}", rec.uncovered);
+        assert!(in_tree(r, &rec.commit, ":(x)/f.txt"));
+        assert!(in_tree(r, &rec.commit, ":!tmp/f.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclude_from_keeps_the_exact_path_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(OsStr::from_bytes(b"/r/n\xff/.git/info/exclude"));
+        assert_eq!(
+            exclude_from_arg(path).as_bytes(),
+            b"--exclude-from=/r/n\xff/.git/info/exclude"
+        );
+    }
+
+    #[test]
+    fn unmerged_nested_files_count_once_against_the_limits() {
+        let repo = committed_repo(&[("a.txt", "a")]);
+        let data = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        let sub = r.join("sub");
+        fs::create_dir(&sub).unwrap();
+        sh(&sub, &["init", "-q", "-b", "main"]);
+        fs::write(sub.join("c.txt"), "base").unwrap();
+        sh(&sub, &["add", "c.txt"]);
+        sh(&sub, &["commit", "-q", "-m", "base"]);
+        sh(&sub, &["checkout", "-q", "-b", "other"]);
+        fs::write(sub.join("c.txt"), "other").unwrap();
+        sh(&sub, &["commit", "-q", "-am", "other"]);
+        sh(&sub, &["checkout", "-q", "main"]);
+        fs::write(sub.join("c.txt"), "main").unwrap();
+        sh(&sub, &["commit", "-q", "-am", "main"]);
+        let merged = Command::new("git")
+            .arg("-C")
+            .arg(&sub)
+            .args(["merge", "-q", "other"])
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(!merged.status.success(), "the merge must conflict");
+        let limits = Limits {
+            files: 1,
+            bytes: 1024,
+        };
+        let tree = worktree_tree_limited(data.path(), r, "t", limits).unwrap();
+        assert!(
+            tree.uncovered.is_empty(),
+            "{:?}",
+            tree.uncovered
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
