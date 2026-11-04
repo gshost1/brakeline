@@ -20,11 +20,21 @@ const MAX_NESTING: usize = 3;
 /// older one's (`shell_legacy`). Each parser misses shapes the other
 /// catches, so a command gets through only when both call it safe.
 pub fn classify(command: &str, cfg: &ShellConfig) -> Verdict {
-    strictest(
-        classify_new(command, cfg),
-        crate::shell_legacy::classify(command, cfg),
-    )
+    let legacy = crate::shell_legacy::classify(command, cfg);
+    // Crafted nesting makes the new tokenizer slow (about 1.4 ms a byte), and
+    // a hook that times out lets the call through. Past this size, judge with
+    // the old parser alone and snapshot at least.
+    if command.len() > MAX_NEW_PARSER_LEN {
+        let too_long = Verdict::Destructive(format!(
+            "command is over {} KB, too long to check fully",
+            MAX_NEW_PARSER_LEN / 1024
+        ));
+        return strictest(too_long, legacy);
+    }
+    strictest(classify_new(command, cfg), legacy)
 }
+
+const MAX_NEW_PARSER_LEN: usize = 16 * 1024;
 
 fn strictest(new: Verdict, legacy: Verdict) -> Verdict {
     let rank = |v: &Verdict| match v {
@@ -2632,6 +2642,16 @@ mod combined {
         }
         assert_eq!(verdict("echo $'a\\tb\\x'"), Verdict::Safe);
         assert_eq!(verdict("echo hi > /dev/shm/scratch"), Verdict::Safe);
+    }
+
+    #[test]
+    fn very_long_commands_skip_the_new_parser_but_still_snapshot() {
+        let nested = format!("x<<E\n{}E\nrm -rf ~", "$(x<<E\n".repeat(6000));
+        let start = std::time::Instant::now();
+        assert!(matches!(verdict(&nested), Verdict::Blocked(_)));
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        let big_write = format!("cat > notes.md <<'EOF'\n{}EOF", "hello\n".repeat(4000));
+        assert!(matches!(verdict(&big_write), Verdict::Destructive(_)));
     }
 
     #[test]
