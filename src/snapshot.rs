@@ -394,8 +394,8 @@ struct Entry {
 }
 
 /// Lists the snapshot's files matching `paths` (all of them when empty),
-/// with the same pathspec rules `git restore` uses. Fails when a pathspec
-/// matches nothing, before anything has been changed.
+/// with the same pathspec rules `git restore` uses. Fails when a given
+/// pathspec matches nothing, before anything has been changed.
 fn snapshot_entries(
     data_dir: &Path,
     repo: &Path,
@@ -404,14 +404,18 @@ fn snapshot_entries(
 ) -> Result<Vec<Entry>> {
     let index = temp_index(data_dir, "entries")?;
     git(repo, &["read-tree", commit], Some(&index.0))?;
-    let mut args = vec!["ls-files", "-s", "-z", "--error-unmatch", "--"];
-    if paths.is_empty() {
-        args.push(".");
-    } else {
+    let mut args = vec!["ls-files", "-s", "-z"];
+    if !paths.is_empty() {
+        args.extend(["--error-unmatch", "--"]);
         args.extend(paths.iter().map(String::as_str));
     }
-    let out =
-        git_raw(repo, &args, Some(&index.0), &[], None).context("the snapshot has no such path")?;
+    let out = match git_raw(repo, &args, Some(&index.0), &[], None) {
+        Ok(out) => out,
+        Err(err) if err.to_string().contains("did not match") => {
+            bail!("nothing in the snapshot matches: {}", paths.join(" "))
+        }
+        Err(err) => return Err(err),
+    };
     Ok(split_z(&out)
         .filter_map(|rec| {
             let tab = rec.iter().position(|b| *b == b'\t')?;
@@ -589,26 +593,25 @@ pub struct Preview {
     pub conflicts: Vec<String>,
 }
 
-/// Files restoring would add or change, compared with the whole current work
-/// tree including untracked files. Deletions are omitted: restore keeps them.
-pub fn preview(data_dir: &Path, record: &SnapshotRecord) -> Result<Preview> {
+/// Files restoring `paths` (or everything) would add or change, compared
+/// with the whole current work tree including untracked files. Deletions are
+/// omitted: restore keeps them.
+pub fn preview(data_dir: &Path, record: &SnapshotRecord, paths: &[String]) -> Result<Preview> {
     let repo = Path::new(&record.repo);
+    // Validates the paths too, with the same error restore would give.
+    let entries = snapshot_entries(data_dir, repo, &record.commit, paths)?;
     let current = worktree_tree(data_dir, repo, "preview")?.id;
-    let diff = git(
-        repo,
-        &[
-            "diff",
-            "--stat",
-            "--diff-filter=AMT",
-            &current,
-            &record.commit,
-            "--",
-        ],
-        None,
-    )?;
-    let entries = snapshot_entries(data_dir, repo, &record.commit, &[])?;
+    let mut args = vec![
+        "diff",
+        "--stat",
+        "--diff-filter=AMT",
+        current.as_str(),
+        record.commit.as_str(),
+        "--",
+    ];
+    args.extend(paths.iter().map(String::as_str));
     Ok(Preview {
-        diff,
+        diff: git(repo, &args, None)?,
         conflicts: type_conflicts(repo, &entries),
     })
 }
@@ -764,7 +767,7 @@ mod tests {
         assert_eq!(fs::read_to_string(r.join("tracked.txt")).unwrap(), "v1");
 
         let found = find(data.path(), &rec.id).unwrap();
-        let shown = preview(data.path(), &found).unwrap();
+        let shown = preview(data.path(), &found, &[]).unwrap();
         assert!(shown.diff.contains("tracked.txt"), "{}", shown.diff);
         assert!(
             shown.diff.contains("new.txt"),
@@ -962,7 +965,7 @@ mod tests {
         fs::write(r.join("d"), "now a file").unwrap();
         fs::remove_file(r.join("keep.txt")).unwrap();
 
-        let shown = preview(data.path(), &rec).unwrap();
+        let shown = preview(data.path(), &rec, &[]).unwrap();
         assert_eq!(shown.conflicts.len(), 2, "{:?}", shown.conflicts);
         assert!(
             shown.conflicts[0].starts_with("d "),
@@ -996,6 +999,31 @@ mod tests {
         restore(data.path(), &rec, &[], true).unwrap();
         assert_eq!(fs::read_to_string(r.join("foo")).unwrap(), "file");
         assert_eq!(fs::read_to_string(r.join("d/a.txt")).unwrap(), "a");
+    }
+
+    #[test]
+    fn preview_and_restore_respect_paths_and_fail_before_any_backup() {
+        let repo = committed_repo(&[("a.txt", "a"), ("b.txt", "b")]);
+        let data = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        let rec = take(data.path(), r, "s", "t", "rm").unwrap().unwrap();
+        fs::remove_file(r.join("a.txt")).unwrap();
+        fs::remove_file(r.join("b.txt")).unwrap();
+
+        let shown = preview(data.path(), &rec, &["a.txt".into()]).unwrap();
+        assert!(shown.diff.contains("a.txt"), "{}", shown.diff);
+        assert!(!shown.diff.contains("b.txt"), "{}", shown.diff);
+
+        let before = list(data.path()).unwrap().len();
+        let err = restore(data.path(), &rec, &["nope.txt".into()], false).unwrap_err();
+        assert!(format!("{err:#}").contains("nope.txt"), "{err:#}");
+        assert!(preview(data.path(), &rec, &["nope.txt".into()]).is_err());
+        assert_eq!(
+            list(data.path()).unwrap().len(),
+            before,
+            "no backup on failure"
+        );
+        assert!(!r.join("a.txt").exists());
     }
 
     #[test]

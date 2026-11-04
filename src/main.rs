@@ -239,7 +239,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         println!("  {line}");
                     }
                 }
-                let preview = snapshot::preview(store.root(), &record)?;
+                let preview = snapshot::preview(store.root(), &record, &paths)?;
                 if preview.diff.is_empty() {
                     println!("the work tree already contains every file in the snapshot.");
                 } else {
