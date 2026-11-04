@@ -10,7 +10,9 @@ use crate::config::Config;
 use crate::meter;
 use crate::shell::{self, Verdict};
 use crate::snapshot;
-use crate::state::{GroupUse, SessionState, Store, fingerprint, now_millis, now_secs, sanitize_id};
+use crate::state::{
+    GroupUse, SessionState, Store, fingerprint, fnv1a, now_millis, now_secs, sanitize_id,
+};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HookInput {
@@ -244,7 +246,7 @@ impl Engine<'_> {
             let repeats = s.identical_in_epoch(fp);
             if repeats as u32 >= loops.max_identical_calls {
                 let msg = format!(
-                    "brakeline: `{name}` was already called {repeats} times with identical input and no file changes in between. The result will not change; use what you have or try something different."
+                    "brakeline: `{name}` was already called {repeats} times with identical input, and neither the files nor its result changed in between. Use what you have or try something different."
                 );
                 return Ok((deny(s, cfg, id, msg), None));
             }
@@ -322,6 +324,9 @@ impl Engine<'_> {
             if failed {
                 s.record_failure(fp, &name);
             } else {
+                if let Some(resp) = &input.tool_response {
+                    s.record_result(fp, fnv1a(&serde_json::to_vec(resp).unwrap_or_default()));
+                }
                 if let Some(i) = s.failures.iter().position(|f| f.fp == fp) {
                     s.failures[i].consecutive = 0;
                 }
@@ -662,6 +667,34 @@ mod tests {
             h.pre("Read", json!({"file_path": "/x/other.rs"})),
             Outcome::Stop(_)
         ));
+    }
+
+    #[test]
+    fn identical_calls_whose_result_changes_are_not_a_loop() {
+        let h = Harness::new();
+        let shot = json!({"action": "screenshot"});
+        let tool = "mcp__Claude_Browser__computer";
+        // A page that keeps changing: never refused.
+        for i in 0..12 {
+            assert!(is_allow(&h.pre(tool, shot.clone())), "call {i}");
+            h.event(
+                "PostToolUse",
+                tool,
+                shot.clone(),
+                Some(json!({"image": format!("frame {i}")})),
+            );
+        }
+        // A page that stopped changing: five of the same, then refused.
+        for _ in 0..5 {
+            assert!(is_allow(&h.pre(tool, shot.clone())));
+            h.event(
+                "PostToolUse",
+                tool,
+                shot.clone(),
+                Some(json!({"image": "frozen"})),
+            );
+        }
+        assert!(matches!(h.pre(tool, shot.clone()), Outcome::Deny(_)));
     }
 
     #[test]
