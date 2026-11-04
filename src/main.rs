@@ -83,6 +83,10 @@ enum Cmd {
         id: String,
         #[arg(long)]
         yes: bool,
+        /// Restore even where a file became a directory or the reverse,
+        /// deleting what is there now (ignored files included).
+        #[arg(long)]
+        force: bool,
         /// Limit the restore to these paths (relative to the repository root).
         #[arg(last = true)]
         paths: Vec<String>,
@@ -127,11 +131,31 @@ fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Loads the effective config for a CLI command. A broken user config is
+/// an error; a broken project config is a warning on stderr.
+fn load_config(cwd: Option<&Path>) -> Result<config::Config> {
+    let (cfg, notices) = config::load_strict(cwd)?;
+    for notice in notices {
+        eprintln!("warning: {notice}");
+    }
+    Ok(cfg)
+}
+
+/// Joins the config notices and, when brakeline's state is unavailable, a
+/// notice saying so, into the one notice the hook shows.
+fn hook_notice(config_notices: &[String], state_error: Option<&anyhow::Error>) -> Option<String> {
+    let mut lines = config_notices.to_vec();
+    if let Some(err) = state_error {
+        lines.push(format!("brakeline state unavailable: {err:#}"));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Cmd::Hook { format, agent } => run_hook(format, matches!(agent, Agent::Droid)),
         Cmd::Check { command } => {
-            let cfg = config::load(Some(&cwd()))?;
+            let cfg = load_config(Some(&cwd()))?;
             let line = command.join(" ");
             let verdict = shell::classify(&line, &cfg.shell);
             match &verdict {
@@ -203,7 +227,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Restore { id, yes, paths } => {
+        Cmd::Restore {
+            id,
+            yes,
+            force,
+            paths,
+        } => {
             let store = Store::open_default()?;
             let record = snapshot::find(store.root(), &id)?;
             if !yes {
@@ -214,25 +243,39 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     ago(record.created_at)
                 );
                 println!("taken before: {}", record.command);
-                let diff = snapshot::preview(store.root(), &record)?;
-                if diff.is_empty() {
+                if !record.uncovered.is_empty() {
+                    println!("not in this snapshot:");
+                    for line in &record.uncovered {
+                        println!("  {line}");
+                    }
+                }
+                let preview = snapshot::preview(store.root(), &record, &paths)?;
+                if !preview.uncovered.is_empty() {
+                    println!("could not read these to compare; restoring may write into them:");
+                    for line in &preview.uncovered {
+                        println!("  {line}");
+                    }
+                }
+                if preview.diff.is_empty() {
                     println!("the work tree already contains every file in the snapshot.");
                 } else {
-                    println!("restoring would write:\n{diff}");
+                    println!("restoring would write:\n{}", preview.diff);
+                }
+                if !preview.conflicts.is_empty() {
+                    println!(
+                        "\nrestoring would replace these, deleting everything in them (ignored files included); --yes refuses them unless --force:"
+                    );
+                    for c in &preview.conflicts {
+                        println!("  {c}");
+                    }
                 }
                 println!(
                     "\nRe-run with --yes to write the snapshot's files back. Files created since are kept, and the current state is snapshotted first."
                 );
                 return Ok(ExitCode::SUCCESS);
             }
-            let backup = snapshot::restore(store.root(), &record, &paths)?;
-            println!("restored snapshot {} into {}", record.id, record.repo);
-            if let Some(b) = backup {
-                println!(
-                    "previous state saved as snapshot {} (`brakeline restore {}` to undo)",
-                    b.id, b.id
-                );
-            }
+            let backup = snapshot::restore(store.root(), &record, &paths, force)?;
+            println!("{}", restore_summary(&record, backup.as_ref()));
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Prune { keep } => {
@@ -249,7 +292,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Config => {
-            let cfg = config::load(Some(&cwd()))?;
+            let cfg = load_config(Some(&cwd()))?;
             if let Some(p) = config::user_config_path() {
                 println!("# user config: {}", p.display());
             }
@@ -298,13 +341,7 @@ fn run_hook(format: HookFormat, infer_failures: bool) -> Result<ExitCode> {
     let input: HookInput = serde_json::from_str(&raw).context("hook input is not valid JSON")?;
     let cwd = input.cwd.as_deref().map(Path::new);
 
-    let (cfg, notice) = match config::load(cwd) {
-        Ok(cfg) => (cfg, None),
-        Err(err) => (
-            config::Config::default(),
-            Some(format!("brakeline config error, using defaults: {err:#}")),
-        ),
-    };
+    let (cfg, notices) = config::load(cwd);
     let format = match format {
         HookFormat::Json => Format::Json,
         HookFormat::ExitCode => Format::ExitCode,
@@ -313,7 +350,7 @@ fn run_hook(format: HookFormat, infer_failures: bool) -> Result<ExitCode> {
         Ok(store) => Engine {
             cfg: &cfg,
             store: &store,
-            notice,
+            notice: hook_notice(&notices, None),
             infer_failures,
         }
         .handle(&input),
@@ -325,7 +362,7 @@ fn run_hook(format: HookFormat, infer_failures: bool) -> Result<ExitCode> {
             let out = Engine {
                 cfg: &cfg,
                 store: &store,
-                notice: Some(format!("brakeline state unavailable: {err:#}")),
+                notice: hook_notice(&notices, Some(&err)),
                 infer_failures,
             }
             .handle(&input);
@@ -341,6 +378,27 @@ fn run_hook(format: HookFormat, infer_failures: bool) -> Result<ExitCode> {
         eprintln!("{stderr}");
     }
     Ok(ExitCode::from(code as u8))
+}
+
+/// What `restore --yes` prints once the files are written.
+fn restore_summary(
+    record: &snapshot::SnapshotRecord,
+    backup: Option<&snapshot::SnapshotRecord>,
+) -> String {
+    let mut out = format!("restored snapshot {} into {}", record.id, record.repo);
+    if let Some(b) = backup {
+        out.push_str(&format!(
+            "\nprevious state saved as snapshot {} (`brakeline restore {}` to undo)",
+            b.id, b.id
+        ));
+        if let Some(note) = b.uncovered_note() {
+            out.push_str(&format!(
+                "\nthe undo snapshot {note} (see `brakeline restore {}`); undoing cannot bring those back.",
+                b.id
+            ));
+        }
+    }
+    out
 }
 
 fn ago(ts: u64) -> String {
@@ -429,4 +487,58 @@ fn status(session: Option<String>, json: bool) -> Result<ExitCode> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_notice_keeps_config_notices_when_state_is_unavailable() {
+        assert_eq!(hook_notice(&[], None), None);
+        let notices = vec!["project config ignored".to_string()];
+        assert_eq!(
+            hook_notice(&notices, None).as_deref(),
+            Some("project config ignored")
+        );
+        let err = anyhow::anyhow!("read-only home");
+        assert_eq!(
+            hook_notice(&notices, Some(&err)).as_deref(),
+            Some("project config ignored\nbrakeline state unavailable: read-only home")
+        );
+    }
+
+    #[test]
+    fn restore_summary_says_what_the_undo_snapshot_left_out() {
+        let record = snapshot::SnapshotRecord {
+            id: "1".into(),
+            repo: "/r".into(),
+            commit: "c".into(),
+            session_id: "s".into(),
+            reason: "r".into(),
+            command: "rm".into(),
+            created_at: 0,
+            uncovered: Vec::new(),
+        };
+        let mut backup = snapshot::SnapshotRecord {
+            id: "2".into(),
+            ..record.clone()
+        };
+        assert_eq!(
+            restore_summary(&record, Some(&backup)),
+            "restored snapshot 1 into /r\nprevious state saved as snapshot 2 (`brakeline restore 2` to undo)"
+        );
+        backup.uncovered = vec!["vendor/big/: too large".into()];
+        let summary = restore_summary(&record, Some(&backup));
+        assert!(
+            summary.ends_with(
+                "\nthe undo snapshot not covered: vendor/big/ (see `brakeline restore 2`); undoing cannot bring those back."
+            ),
+            "{summary}"
+        );
+        assert_eq!(
+            restore_summary(&record, None),
+            "restored snapshot 1 into /r"
+        );
+    }
 }

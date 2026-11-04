@@ -252,10 +252,16 @@ impl Engine<'_> {
             &reason,
             command.unwrap_or(""),
         ) {
-            Ok(Some(rec)) => format!(
-                "brakeline: snapshot {} saved before {reason}. Undo with `brakeline restore {}`.",
-                rec.id, rec.id
-            ),
+            Ok(Some(rec)) => {
+                let mut message = format!(
+                    "brakeline: snapshot {} saved before {reason}. Undo with `brakeline restore {}`.",
+                    rec.id, rec.id
+                );
+                if let Some(note) = rec.uncovered_note() {
+                    message.push_str(&format!(" {note} (see `brakeline restore {}`).", rec.id));
+                }
+                message
+            }
             Ok(None) => format!(
                 "brakeline: {reason}, and this directory is not a git repository, so no snapshot was taken."
             ),
