@@ -155,9 +155,20 @@ pub fn install(path: &Path, command: &str, target: Target, write: bool) -> Resul
             std::fs::create_dir_all(parent)?;
         }
         if had_file {
+            // The first backup holds the settings from before brakeline was
+            // ever installed; later installs must not replace it with a file
+            // that already has brakeline's hooks merged in.
             let backup = path.with_extension("json.brakeline-backup");
-            std::fs::copy(path, &backup)
-                .with_context(|| format!("cannot back up to {}", backup.display()))?;
+            if backup.symlink_metadata().is_ok() {
+                eprintln!(
+                    "kept existing backup {} (settings from before the first brakeline install)",
+                    backup.display()
+                );
+            } else {
+                std::fs::copy(path, &backup)
+                    .with_context(|| format!("cannot back up to {}", backup.display()))?;
+                eprintln!("original settings backed up to {}", backup.display());
+            }
         }
         write_atomic(path, text.as_bytes())?;
     }
@@ -233,6 +244,18 @@ mod tests {
             hook_command(Path::new("/Users/a b/brakeline")),
             "'/Users/a b/brakeline' hook"
         );
+    }
+
+    #[test]
+    fn reinstall_keeps_the_original_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"theme\":\"dark\"}").unwrap();
+        install_claude(&path, "brakeline hook", true).unwrap();
+        install_claude(&path, "/other/brakeline hook", true).unwrap();
+        let backup = std::fs::read_to_string(path.with_extension("json.brakeline-backup")).unwrap();
+        assert_eq!(backup, "{\"theme\":\"dark\"}");
     }
 
     #[test]
