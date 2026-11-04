@@ -3,6 +3,7 @@ mod hook;
 mod install;
 mod meter;
 mod shell;
+mod shell_legacy;
 mod snapshot;
 mod state;
 

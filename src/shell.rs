@@ -16,7 +16,30 @@ pub enum Verdict {
 
 const MAX_NESTING: usize = 3;
 
+/// The verdict the hook acts on: the stricter of this parser's and the
+/// older one's (`shell_legacy`). Each parser misses shapes the other
+/// catches, so a command gets through only when both call it safe.
 pub fn classify(command: &str, cfg: &ShellConfig) -> Verdict {
+    strictest(
+        classify_new(command, cfg),
+        crate::shell_legacy::classify(command, cfg),
+    )
+}
+
+fn strictest(new: Verdict, legacy: Verdict) -> Verdict {
+    let rank = |v: &Verdict| match v {
+        Verdict::Safe => 0,
+        Verdict::Destructive(_) => 1,
+        Verdict::Blocked(_) => 2,
+    };
+    if rank(&legacy) > rank(&new) {
+        legacy
+    } else {
+        new
+    }
+}
+
+fn classify_new(command: &str, cfg: &ShellConfig) -> Verdict {
     let lowered = command.to_ascii_lowercase();
     for needle in &cfg.blocked_substrings {
         if lowered.contains(&needle.to_ascii_lowercase()) {
@@ -1252,6 +1275,9 @@ fn analyze_segment(
 /// Rough test for "this shell command probably changed files", used to tell
 /// progress apart from an agent re-running the same thing.
 pub fn mutates(command: &str) -> bool {
+    if crate::shell_legacy::mutates(command) {
+        return true;
+    }
     if matches!(
         classify(command, &ShellConfig::default()),
         Verdict::Destructive(_)
@@ -1648,6 +1674,9 @@ fn is_unguarded_variable_path(target: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These tests pin the new parser on its own; `combined` below covers the
+    // verdict the hook acts on.
+    use super::classify_new as classify;
 
     fn cfg() -> ShellConfig {
         ShellConfig::default()
@@ -2501,5 +2530,70 @@ mod tests {
             let _ = split_segments(cmd);
         }
         assert!(blocked(&format!("{deep}rm -rf ~")));
+    }
+}
+
+#[cfg(test)]
+mod combined {
+    use super::*;
+
+    fn verdict(cmd: &str) -> Verdict {
+        classify(cmd, &ShellConfig::default())
+    }
+
+    fn new_only(cmd: &str) -> Verdict {
+        classify_new(cmd, &ShellConfig::default())
+    }
+
+    /// Shapes the new tokenizer misreads (found in review round 3) that the
+    /// old parser still catches, so the combined verdict blocks them.
+    #[test]
+    fn old_parser_covers_new_parser_misses() {
+        for cmd in [
+            "echo ${x:- #}; rm -rf ~",
+            "(( x = '))' )); rm -rf ~",
+            "(( '))' )) && rm -rf ~",
+            "cat <<$'E\\x4fF'\nhi\nEOF\nrm -rf ~",
+            "cat > x.sh <<EOF\nrm -rf ~\nEOF\n./x.sh",
+            "dd if=/dev/zero of=/dev/fd/../disk0",
+        ] {
+            assert!(
+                !matches!(new_only(cmd), Verdict::Blocked(_)),
+                "{cmd:?} is no longer a miss for the new parser"
+            );
+            assert!(matches!(verdict(cmd), Verdict::Blocked(_)), "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn stricter_verdict_wins_both_ways() {
+        // Only the new parser sees this one.
+        assert!(matches!(verdict("chmod -Rv 777 ~"), Verdict::Blocked(_)));
+        assert!(matches!(verdict("rm -rf ~"), Verdict::Blocked(_)));
+        assert_eq!(verdict("cargo test --all"), Verdict::Safe);
+        assert!(matches!(
+            verdict("git reset --hard"),
+            Verdict::Destructive(_)
+        ));
+    }
+
+    /// False alarms the old parser already raises on main and the new one
+    /// fixed. The combined verdict keeps them: it errs on the safe side and
+    /// is never more permissive than main was.
+    #[test]
+    fn inherits_old_false_alarms() {
+        let rank = |v: &Verdict| match v {
+            Verdict::Safe => 0,
+            Verdict::Destructive(_) => 1,
+            Verdict::Blocked(_) => 2,
+        };
+        for cmd in [
+            "cargo test # cleanup; rm -rf /",
+            "cat > /tmp/notes.md <<'EOF'\ngit push --force origin main\nEOF",
+            "grep -n \">\" src/main.rs",
+            "command -v rm",
+        ] {
+            assert!(rank(&verdict(cmd)) > rank(&new_only(cmd)), "{cmd:?}");
+        }
     }
 }
