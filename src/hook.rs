@@ -193,9 +193,9 @@ impl Engine<'_> {
                     );
                     return Ok((deny(s, cfg, id, msg), None));
                 }
-                if f.total >= loops.max_total_failures_per_call {
+                if f.epoch == s.epoch && f.total >= loops.max_total_failures_per_call {
                     let msg = format!(
-                        "brakeline: `{}` has failed {} times this session. Step back and try a different approach, or ask the user.",
+                        "brakeline: `{}` has failed {} times with no file changes in between, passing only sometimes. Step back and try a different approach, or ask the user.",
                         f.label, f.total
                     );
                     return Ok((deny(s, cfg, id, msg), None));
@@ -568,6 +568,52 @@ mod tests {
         assert!(is_allow(
             &h.pre("Bash", json!({"command": "npm run build"}))
         ));
+    }
+
+    #[test]
+    fn edit_test_cycles_never_hit_the_failure_cap() {
+        let h = Harness::new();
+        let test = json!({"command": "cargo test"});
+        for round in 0..30 {
+            assert!(is_allow(&h.pre("Bash", test.clone())), "round {round}");
+            h.event("PostToolUseFailure", "Bash", test.clone(), None);
+            h.event(
+                "PostToolUse",
+                "Edit",
+                json!({"file_path": format!("/x/{round}.rs")}),
+                Some(json!({})),
+            );
+        }
+    }
+
+    #[test]
+    fn a_flaky_command_is_capped_until_files_change() {
+        let mut h = Harness::new();
+        h.cfg.loops.max_total_failures_per_call = 4;
+        // With defaults the identical-call check fires first; loosen it to
+        // reach the backstop.
+        h.cfg.loops.max_identical_calls = 100;
+        let test = json!({"command": "cargo test"});
+        // Fails and passes in turn with no edits: never 3 failures in a row.
+        for i in 0..4 {
+            assert!(is_allow(&h.pre("Bash", test.clone())), "fail {i}");
+            h.event("PostToolUseFailure", "Bash", test.clone(), None);
+            if i < 3 {
+                assert!(is_allow(&h.pre("Bash", test.clone())), "pass {i}");
+                h.event("PostToolUse", "Bash", test.clone(), Some(json!({})));
+            }
+        }
+        match h.pre("Bash", test.clone()) {
+            Outcome::Deny(reason) => assert!(reason.contains("failed 4 times"), "{reason}"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+        h.event(
+            "PostToolUse",
+            "Edit",
+            json!({"file_path": "/x/a.rs"}),
+            Some(json!({})),
+        );
+        assert!(is_allow(&h.pre("Bash", test.clone())));
     }
 
     #[test]

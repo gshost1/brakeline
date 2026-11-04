@@ -21,7 +21,8 @@ pub struct LoopConfig {
     pub window: u32,
     /// Failures of the same call in a row, with no file edit in between.
     pub max_consecutive_failures: u32,
-    /// Failures of the same call across the whole session, edits or not.
+    /// Failures of the same call with no file edit in between, even when
+    /// successes are mixed in (a flaky command).
     pub max_total_failures_per_call: u32,
     /// Consecutive brakeline denials before the whole run is stopped.
     pub max_denials_before_stop: u32,

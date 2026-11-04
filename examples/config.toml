@@ -10,7 +10,8 @@ max_identical_calls = 5
 window = 40
 # The same call failing this many times in a row, with no edit in between, is refused.
 max_consecutive_failures = 3
-# The same call failing this many times in a session is refused, edits or not.
+# The same call failing this many times with no file edit in between is
+# refused, even with successes mixed in (a flaky command).
 max_total_failures_per_call = 12
 # This many refusals in a row stops the whole run until `brakeline reset`.
 max_denials_before_stop = 3
