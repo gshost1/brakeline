@@ -215,6 +215,9 @@ pub fn fingerprint(tool: &str, input: &Value) -> u64 {
 pub struct RecentCall {
     pub fp: u64,
     pub epoch: u64,
+    /// Hash of what the call returned, once it has reported back.
+    #[serde(default)]
+    pub out: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,9 +369,39 @@ impl SessionState {
         self.recent.push_back(RecentCall {
             fp,
             epoch: self.epoch,
+            out: None,
         });
         while self.recent.len() > window {
             self.recent.pop_front();
+        }
+    }
+
+    /// Records what the latest call `fp` returned. A result that differs from
+    /// the previous one means the call is not stuck (a screenshot of a page
+    /// that changed, a poll of a job still running), so its earlier repeats
+    /// stop counting toward the identical-call limit.
+    pub fn record_result(&mut self, fp: u64, out: u64) {
+        let Some(i) = self
+            .recent
+            .iter()
+            .rposition(|c| c.fp == fp && c.out.is_none())
+        else {
+            return;
+        };
+        let prev = self
+            .recent
+            .iter()
+            .take(i)
+            .rev()
+            .find_map(|c| (c.fp == fp).then_some(c.out).flatten());
+        self.recent[i].out = Some(out);
+        if prev.is_some_and(|p| p != out) {
+            let mut at = 0;
+            self.recent.retain(|c| {
+                let keep = at >= i || c.fp != fp;
+                at += 1;
+                keep
+            });
         }
     }
 }
