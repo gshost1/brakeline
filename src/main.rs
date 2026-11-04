@@ -240,6 +240,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     }
                 }
                 let preview = snapshot::preview(store.root(), &record, &paths)?;
+                if !preview.uncovered.is_empty() {
+                    println!("could not read these to compare; restoring may write into them:");
+                    for line in &preview.uncovered {
+                        println!("  {line}");
+                    }
+                }
                 if preview.diff.is_empty() {
                     println!("the work tree already contains every file in the snapshot.");
                 } else {

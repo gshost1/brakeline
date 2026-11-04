@@ -882,6 +882,9 @@ pub struct Preview {
     pub diff: String,
     /// Paths that are a file on one side and a directory on the other.
     pub conflicts: Vec<String>,
+    /// Parts of the current work tree that could not be read, each with the
+    /// reason. They are left out of `diff` rather than shown as changes.
+    pub uncovered: Vec<String>,
 }
 
 /// Files restoring `paths` (or everything) would add or change, compared
@@ -891,19 +894,27 @@ pub fn preview(data_dir: &Path, record: &SnapshotRecord, paths: &[String]) -> Re
     let repo = Path::new(&record.repo);
     // Validates the paths too, with the same error restore would give.
     let entries = snapshot_entries(data_dir, repo, &record.commit, paths)?;
-    let current = worktree_tree(data_dir, repo, "preview")?.id;
+    let current = worktree_tree(data_dir, repo, "preview")?;
+    let excludes: Vec<String> = current
+        .uncovered
+        .iter()
+        .map(|u| format!(":(exclude,literal){}", u.path))
+        .collect();
     let mut args = vec![
         "diff",
         "--stat",
         "--diff-filter=AMT",
-        current.as_str(),
+        current.id.as_str(),
         record.commit.as_str(),
         "--",
     ];
     args.extend(paths.iter().map(String::as_str));
+    args.extend(excludes.iter().map(String::as_str));
+    let diff = git(repo, &args, None)?;
     Ok(Preview {
-        diff: git(repo, &args, None)?,
+        diff,
         conflicts: type_conflicts(repo, &entries),
+        uncovered: current.uncovered.iter().map(ToString::to_string).collect(),
     })
 }
 
@@ -1497,6 +1508,30 @@ mod tests {
         let rec = take(data.path(), o, "s", "t", "rm").unwrap().unwrap();
         restore(data.path(), &rec, &[], false).unwrap();
         assert!(!o.join("s.txt").exists());
+    }
+
+    #[test]
+    fn preview_lists_uncovered_repositories_instead_of_reporting_them_as_changes() {
+        let repo = committed_repo(&[("a.txt", "a")]);
+        let data = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        let mut deep = r.to_path_buf();
+        let mut dirs = Vec::new();
+        for i in 0..=MAX_NESTED_DEPTH {
+            deep = deep.join(format!("d{i}"));
+            dirs.push(deep.clone());
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("f.txt"), "f").unwrap();
+        let rec = take(data.path(), r, "s", "t", "rm").unwrap().unwrap();
+        // Now each directory is a repository: the deepest is out of reach.
+        for d in &dirs {
+            sh(d, &["init", "-q"]);
+        }
+        let shown = preview(data.path(), &rec, &[]).unwrap();
+        assert!(!shown.diff.contains("f.txt"), "{}", shown.diff);
+        assert_eq!(shown.uncovered.len(), 1, "{:?}", shown.uncovered);
+        assert!(shown.uncovered[0].contains("d8/"), "{:?}", shown.uncovered);
     }
 
     #[test]
