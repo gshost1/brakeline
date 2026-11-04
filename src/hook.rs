@@ -323,8 +323,8 @@ fn unsaved_notice(outcome: Outcome, save_err: Option<anyhow::Error>) -> Outcome 
 
 /// A gap between hook events longer than this is idle time (the agent is
 /// waiting on the user, or the chat was resumed later) and does not count
-/// toward the session time budget. A single tool call that runs longer than
-/// this is undercounted by the excess.
+/// toward the session time budget. The cost: a single tool call that runs
+/// longer than this (a long build) is not counted at all.
 const IDLE_GAP_SECS: u64 = 30 * 60;
 
 fn touch(s: &mut SessionState, input: &HookInput, now: u64) {
@@ -334,10 +334,17 @@ fn touch(s: &mut SessionState, input: &HookInput, now: u64) {
     if s.started_at == 0 {
         s.started_at = now;
     }
+    // A record from before active time was tracked keeps its wall-clock
+    // time, so upgrading never hands a running session a fresh budget.
+    let active = s.active_secs.get_or_insert(if s.started_at > 0 {
+        s.last_seen.saturating_sub(s.started_at)
+    } else {
+        0
+    });
     if s.last_seen > 0 && now > s.last_seen {
         let gap = now - s.last_seen;
         if gap <= IDLE_GAP_SECS {
-            s.active_secs += gap;
+            *active += gap;
         }
     }
     s.last_seen = s.last_seen.max(now);
@@ -404,7 +411,7 @@ fn budget_uses(s: &SessionState, cfg: &Config) -> Vec<BudgetUse> {
         });
     }
     if let Some(limit) = b.max_session_minutes {
-        let minutes = s.active_secs / 60;
+        let minutes = s.active_secs.unwrap_or(0) / 60;
         out.push(BudgetUse {
             name: "session time",
             used: minutes as f64,
@@ -741,7 +748,7 @@ mod tests {
         // A chat resumed after three idle hours is not out of time.
         back(3 * 3600);
         assert!(is_allow(&h.pre("Read", json!({"file_path": "/b"}))));
-        assert_eq!(h.store.load("sess").unwrap().unwrap().active_secs, 0);
+        assert_eq!(h.store.load("sess").unwrap().unwrap().active_secs, Some(0));
         // Three 20-minute stretches of work use up the hour.
         for i in 0..2 {
             back(20 * 60);
@@ -754,6 +761,26 @@ mod tests {
             Outcome::Stop(r) => assert!(r.contains("60 of 60 active minutes"), "{r}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_session_recorded_before_active_time_keeps_its_wall_clock_time() {
+        let mut h = Harness::new();
+        h.cfg.budget.max_session_minutes = Some(60);
+        assert!(is_allow(&h.pre("Read", json!({"file_path": "/a"}))));
+        h.store
+            .with_session("sess", |s| {
+                s.started_at -= 61 * 60;
+                s.last_seen -= 60;
+                s.active_secs = None;
+                Ok(())
+            })
+            .unwrap();
+        // 60 minutes recorded the old way plus a 1-minute gap.
+        assert!(matches!(
+            h.pre("Read", json!({"file_path": "/b"})),
+            Outcome::Stop(_)
+        ));
     }
 
     #[test]

@@ -268,7 +268,8 @@ pub struct SessionState {
     /// Seconds the session was working: gaps between hook events up to
     /// `IDLE_GAP_SECS` count, longer ones (waiting on the user, a resumed
     /// chat) do not. The session time budget is measured against this.
-    pub active_secs: u64,
+    /// `None` in records written before it existed.
+    pub active_secs: Option<u64>,
     pub tool_calls: u64,
     /// Bumped whenever the agent changes files; loop counters only compare
     /// calls within the same epoch.
