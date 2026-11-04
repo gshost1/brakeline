@@ -973,15 +973,39 @@ pub fn restore(
             conflicts.join("\n  ")
         );
     }
-    // Every skip-worktree path is kept out of a whole-tree restore: where
-    // the snapshot differs from the index, `git restore` would otherwise
-    // write it. Only those holding local work are restored, separately.
+    // `git restore -- .` writes a skip-worktree file whose index entry
+    // differs from the snapshot (it replaces the entry, dropping the flag).
+    // Those are kept out of a whole-tree restore, and the ones holding local
+    // work are restored separately.
     let skip = if paths.is_empty() {
         flagged_paths(repo, None)?.skip_worktree
     } else {
         Vec::new()
     };
     let sparse_work = skip_worktree_to_restore(repo, record, &entries, &skip)?;
+    let differs: Vec<Vec<u8>> = if skip.is_empty() {
+        Vec::new()
+    } else {
+        let out = git_raw(
+            repo,
+            &[
+                "diff-index",
+                "--cached",
+                "--name-only",
+                "-z",
+                &record.commit,
+                "--",
+            ],
+            None,
+            &[],
+            None,
+        )?;
+        let changed: std::collections::HashSet<&[u8]> = split_z(&out).collect();
+        skip.iter()
+            .filter(|p| changed.contains(p.as_slice()))
+            .cloned()
+            .collect()
+    };
     let backup = take(
         data_dir,
         repo,
@@ -992,12 +1016,13 @@ pub fn restore(
     let source = format!("--source={}", record.commit);
     if paths.is_empty() {
         let skip_set: std::collections::HashSet<&[u8]> = skip.iter().map(Vec::as_slice).collect();
-        // git restore fails when the pathspec matches nothing.
+        // git restore fails when the pathspec matches nothing, and it does
+        // not match skip-worktree entries.
         let rest = entries
             .iter()
             .any(|e| !skip_set.contains(e.path.as_slice()));
         let mut spec = b".\0".to_vec();
-        for p in &skip {
+        for p in &differs {
             spec.extend_from_slice(b":(exclude,literal)");
             spec.extend_from_slice(p);
             spec.push(0);
