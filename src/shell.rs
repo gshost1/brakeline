@@ -140,6 +140,69 @@ fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
+/// Options that take a value, per wrapper: (short letters, long names).
+/// Getting one wrong shifts the parse, so `sudo -D /tmp rm -rf ~` would
+/// look like the program `/tmp`. Options whose value is optional and only
+/// ever inline (xargs `--replace[=R]`) are flags here.
+fn wrapper_value_options(wrapper: &str) -> Option<(&'static str, &'static [&'static str])> {
+    Some(match wrapper {
+        "sudo" => (
+            "aCcDghpRrTtUu",
+            &[
+                "auth-type",
+                "chdir",
+                "chroot",
+                "close-from",
+                "command-timeout",
+                "group",
+                "host",
+                "login-class",
+                "other-user",
+                "prompt",
+                "role",
+                "type",
+                "user",
+            ],
+        ),
+        "doas" => ("aCu", &[]),
+        "env" => ("CLPSu", &["chdir", "split-string", "unset"]),
+        "exec" => ("a", &[]),
+        "command" | "builtin" | "nohup" => ("", &[]),
+        "time" => ("fo", &["format", "output"]),
+        "nice" => ("n", &["adjustment"]),
+        "xargs" => (
+            "adEILnPs",
+            &[
+                "arg-file",
+                "delimiter",
+                "max-args",
+                "max-chars",
+                "max-procs",
+                "process-slot-var",
+            ],
+        ),
+        "stdbuf" => ("eio", &["error", "input", "output"]),
+        "timeout" => ("ks", &["kill-after", "signal"]),
+        _ => return None,
+    })
+}
+
+/// Whether a wrapper option word consumes the next word as its value:
+/// `-u root`, `-Eu root`, `--user root`, or an abbreviation like `--us root`
+/// (getopt_long accepts any unambiguous prefix). `-uroot` and `--user=root`
+/// carry the value inline.
+fn takes_next_word(opt: &str, shorts: &str, longs: &[&str]) -> bool {
+    match opt.strip_prefix("--") {
+        Some(long) => {
+            !long.is_empty() && !long.contains('=') && longs.iter().any(|l| l.starts_with(long))
+        }
+        None => opt
+            .get(1..)
+            .and_then(|cluster| cluster.find(|c| shorts.contains(c)))
+            .is_some_and(|p| p + 2 == opt.len()),
+    }
+}
+
 /// Drops env assignments and wrapper commands (`sudo`, `env`, `xargs`, ...)
 /// so the real program name comes first.
 fn strip_wrappers(words: &[String]) -> &[String] {
@@ -149,29 +212,33 @@ fn strip_wrappers(words: &[String]) -> &[String] {
         let is_assignment = w.split_once('=').is_some_and(|(k, _)| {
             !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_')
         });
-        if is_assignment {
+        if is_assignment
+            || matches!(
+                w,
+                "{" | "}" | "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until"
+            )
+        {
             i += 1;
             continue;
         }
-        match basename(w) {
-            "{" | "}" | "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until" => i += 1,
-            "sudo" | "doas" | "env" | "command" | "builtin" | "exec" | "nohup" | "time"
-            | "nice" | "xargs" | "stdbuf" => {
-                i += 1;
-                // Skip the wrapper's own options (and `-u user`-style values).
-                while i < words.len() && words[i].starts_with('-') {
-                    let takes_value = matches!(words[i].as_str(), "-u" | "-g" | "-n" | "-I" | "-P");
-                    i += if takes_value { 2 } else { 1 };
-                }
+        let wrapper = basename(w);
+        let Some((shorts, longs)) = wrapper_value_options(wrapper) else {
+            break;
+        };
+        i += 1;
+        // Skip the wrapper's own options and their values. A bare `-` is
+        // env's `-i`.
+        while let Some(opt) = words.get(i).filter(|o| o.starts_with('-')) {
+            i += 1;
+            if opt == "--" {
+                break;
             }
-            "timeout" => {
+            if takes_next_word(opt, shorts, longs) {
                 i += 1;
-                while i < words.len() && words[i].starts_with('-') {
-                    i += 1;
-                }
-                i += 1; // duration
             }
-            _ => break,
+        }
+        if wrapper == "timeout" {
+            i += 1; // duration
         }
     }
     &words[i.min(words.len())..]
@@ -635,6 +702,81 @@ mod tests {
         ] {
             assert!(blocked(cmd), "{cmd}");
         }
+    }
+
+    #[test]
+    fn timeout_options_with_values_are_skipped() {
+        for cmd in [
+            "timeout -s KILL 10 rm -rf ~/",
+            "timeout -k 5 30 rm -rf /",
+            "timeout --signal KILL 10 rm -rf ~",
+            "timeout --kill-after 5 30 rm -rf /",
+            "timeout --signal=KILL 10 rm -rf ~",
+            "timeout -sKILL 10 rm -rf ~",
+            "timeout -vs KILL 10 rm -rf ~",
+            "timeout --preserve-status -s TERM -k 1 10 rm -rf ~",
+            "timeout -- 10 rm -rf ~",
+            "sudo timeout -s KILL 10 rm -rf /",
+        ] {
+            assert!(blocked(cmd), "{cmd}");
+        }
+        assert!(destructive("timeout -s KILL 10 rm -rf build"));
+        assert!(destructive("timeout -k 5 30 rm -rf build"));
+        assert!(destructive("timeout 10 rm -rf build"));
+        assert_eq!(
+            classify("timeout -s INT 30 cargo test", &cfg()),
+            Verdict::Safe
+        );
+    }
+
+    #[test]
+    fn wrapper_options_with_values_are_skipped() {
+        for cmd in [
+            "sudo -u root rm -rf ~",
+            "sudo -uroot rm -rf ~",
+            "sudo -Eu root rm -rf ~",
+            "sudo --user=root rm -rf ~",
+            "sudo --user root rm -rf ~",
+            "sudo -D /tmp rm -rf ~",
+            "sudo -p prompt rm -rf ~",
+            "sudo -U bob rm -rf ~",
+            "sudo -h host rm -rf ~",
+            "sudo -s rm -rf ~",
+            "sudo -- rm -rf ~",
+            "doas -u root rm -rf /",
+            "env -C /tmp rm -rf ~",
+            "env -u PATH rm -rf ~",
+            "env -- rm -rf ~",
+            "env -i FOO=1 rm -rf ~",
+            "env - rm -rf ~",
+            "env -S 'x' rm -rf ~",
+            "doas -a style rm -rf /",
+            "sudo -a type rm -rf ~",
+            "sudo -c class rm -rf ~",
+            "sudo --us root rm -rf ~",
+            "timeout --sig KILL 10 rm -rf ~",
+            "timeout --kill 5 10 rm -rf ~",
+            "xargs --replace rm -rf ~",
+            "xargs --max-lines rm -rf ~",
+            "xargs --replace={} rm -rf ~",
+            "exec -a name rm -rf ~",
+            "time -o out.txt rm -rf ~",
+            "time -f %e rm -rf ~",
+            "nice -n 5 rm -rf ~",
+            "nice --adjustment 5 rm -rf ~",
+            "nice -5 rm -rf ~",
+            "stdbuf -o L rm -rf ~",
+            "stdbuf -oL rm -rf ~",
+            "xargs -L 1 rm -rf ~",
+            "xargs -d x rm -rf ~",
+            "xargs -I {} rm -rf ~",
+            "xargs -0 -n 1 rm -rf ~",
+            "nohup nice -n 5 timeout -s KILL 10 rm -rf ~",
+        ] {
+            assert!(blocked(cmd), "{cmd}");
+        }
+        assert!(destructive("sudo -D /tmp rm -rf build"));
+        assert!(destructive("xargs -L 1 rm -rf build"));
     }
 
     #[test]
