@@ -40,15 +40,61 @@ pub fn ensure_private_dir(dir: &Path) -> Result<()> {
 }
 
 /// Write via a temp file and rename, so a crash never leaves a torn file.
+/// A symlinked `path` is written through to its target (the link stays), and
+/// an existing file keeps its permissions; new files are private (0600).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let path = resolve_symlinks(path)?;
+    let mode = fs::metadata(&path).ok().map(|m| m.permissions());
+    // Next to the target, so the rename stays on one filesystem.
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    {
-        let mut f =
-            File::create(&tmp).with_context(|| format!("cannot write {}", tmp.display()))?;
-        f.write_all(bytes)?;
-        f.sync_all().ok();
+    let _ = fs::remove_file(&tmp);
+    let result = write_new(&tmp, bytes, mode).and_then(|()| {
+        fs::rename(&tmp, &path).with_context(|| format!("cannot replace {}", path.display()))
+    });
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))
+    result
+}
+
+fn write_new(tmp: &Path, bytes: &[u8], mode: Option<fs::Permissions>) -> Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(tmp)
+        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    if let Some(mode) = mode {
+        f.set_permissions(mode)
+            .with_context(|| format!("cannot set permissions on {}", tmp.display()))?;
+    }
+    f.write_all(bytes)
+        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    f.sync_all().ok();
+    Ok(())
+}
+
+/// Follows symlinks to the final path, which need not exist yet.
+fn resolve_symlinks(path: &Path) -> Result<PathBuf> {
+    let mut path = path.to_path_buf();
+    for _ in 0..40 {
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let target = fs::read_link(&path)
+                    .with_context(|| format!("cannot read link {}", path.display()))?;
+                path = match path.parent() {
+                    Some(dir) => dir.join(target),
+                    None => target,
+                };
+            }
+            _ => return Ok(path),
+        }
+    }
+    anyhow::bail!("too many levels of symbolic links at {}", path.display())
 }
 
 /// Holds an exclusive advisory lock until dropped.
@@ -466,6 +512,49 @@ mod tests {
         let loaded = store.load("s1").unwrap().unwrap();
         assert_eq!(loaded.tool_calls, 7);
         assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_mode_and_new_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let fresh = dir.path().join("fresh.json");
+        write_atomic(&fresh, b"{}").unwrap();
+        assert_eq!(mode(&fresh), 0o600);
+        let shared = dir.path().join("shared.json");
+        fs::write(&shared, b"old").unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o640)).unwrap();
+        write_atomic(&shared, b"new").unwrap();
+        assert_eq!(mode(&shared), 0o640);
+        assert_eq!(fs::read(&shared).unwrap(), b"new");
+        // No temp files left behind.
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_follows_symlink_chains() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        fs::write(&real, b"old").unwrap();
+        let mid = dir.path().join("mid.json");
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&real, &mid).unwrap();
+        std::os::unix::fs::symlink("mid.json", &link).unwrap();
+        write_atomic(&link, b"new").unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(fs::symlink_metadata(&mid).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(&real).unwrap(), b"new");
+        let lo = dir.path().join("loop");
+        std::os::unix::fs::symlink("loop", &lo).unwrap();
+        assert!(write_atomic(&lo, b"x").is_err());
     }
 
     #[test]

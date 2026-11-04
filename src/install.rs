@@ -258,6 +258,34 @@ mod tests {
         assert_eq!(backup, "{\"theme\":\"dark\"}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn install_writes_through_a_symlink_and_keeps_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles/claude-settings.json");
+        std::fs::create_dir_all(dotfiles.parent().unwrap()).unwrap();
+        std::fs::write(&dotfiles, "{\"env\":{\"TOKEN\":\"x\"}}").unwrap();
+        std::fs::set_permissions(&dotfiles, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let path = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Relative link, as dotfile managers often make.
+        std::os::unix::fs::symlink("../dotfiles/claude-settings.json", &path).unwrap();
+
+        install_claude(&path, "brakeline hook", true).unwrap();
+
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+        let target: Value =
+            serde_json::from_str(&std::fs::read_to_string(&dotfiles).unwrap()).unwrap();
+        assert_eq!(target["env"]["TOKEN"], "x");
+        assert!(target["hooks"]["PreToolUse"].is_array());
+        let mode = std::fs::metadata(&dotfiles).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let backup = path.with_extension("json.brakeline-backup");
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
     #[test]
     fn install_writes_backup() {
         let dir = tempfile::tempdir().unwrap();
