@@ -32,6 +32,29 @@ pub struct SnapshotRecord {
     pub uncovered: Vec<String>,
 }
 
+impl SnapshotRecord {
+    /// A one-line summary of the paths the snapshot left out, if any:
+    /// `not covered: a/, b/ (+2 more)`.
+    pub fn uncovered_note(&self) -> Option<String> {
+        const SHOWN: usize = 3;
+        if self.uncovered.is_empty() {
+            return None;
+        }
+        // Entries read `path/: reason`; the path alone is enough here.
+        let names: Vec<&str> = self
+            .uncovered
+            .iter()
+            .take(SHOWN)
+            .map(|u| u.split_once("/: ").map_or(u.as_str(), |(p, _)| p))
+            .collect();
+        let mut note = format!("not covered: {}/", names.join("/, "));
+        if self.uncovered.len() > SHOWN {
+            note.push_str(&format!(" (+{} more)", self.uncovered.len() - SHOWN));
+        }
+        Some(note)
+    }
+}
+
 /// Runs git in `repo` and returns its raw stdout. `env` adds variables (such
 /// as `GIT_DIR`), and `input` is written to stdin.
 fn git_raw(
@@ -1619,6 +1642,29 @@ mod tests {
         let rec = take(data.path(), r, "s", "t", "rm").unwrap().unwrap();
         assert!(in_tree(r, &rec.commit, "sub/b.txt"));
         assert!(!in_tree(r, &rec.commit, "sub/notes.private"));
+    }
+
+    #[test]
+    fn uncovered_note_names_the_first_paths() {
+        let mut rec = SnapshotRecord {
+            id: "1".into(),
+            repo: "/r".into(),
+            commit: "c".into(),
+            session_id: "s".into(),
+            reason: "r".into(),
+            command: "rm".into(),
+            created_at: 0,
+            uncovered: Vec::new(),
+        };
+        assert_eq!(rec.uncovered_note(), None);
+        rec.uncovered = vec!["a/: too large".into(), "b/c/: git failed: x/: y".into()];
+        assert_eq!(rec.uncovered_note().unwrap(), "not covered: a/, b/c/");
+        rec.uncovered
+            .extend(["d/: e".into(), "f/: g".into(), "h/: i".into()]);
+        assert_eq!(
+            rec.uncovered_note().unwrap(),
+            "not covered: a/, b/c/, d/ (+2 more)"
+        );
     }
 
     #[test]
