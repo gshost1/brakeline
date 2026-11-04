@@ -271,7 +271,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             };
             let exe = std::env::current_exe().context("cannot locate the brakeline binary")?;
             let path = target.path(project, &cwd())?;
-            let text = install::install(&path, &target.hook_command(&exe), target, write)?;
+            let text = install::install(&path, &target.hook_command(&exe), target, project, write)?;
             if write {
                 println!("updated {}", path.display());
                 println!("start a new session (or review /hooks) to pick up the change.");
