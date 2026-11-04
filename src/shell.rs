@@ -187,25 +187,155 @@ fn wrapper_value_options(wrapper: &str) -> Option<(&'static str, &'static [&'sta
     })
 }
 
-/// Whether a wrapper option word consumes the next word as its value:
-/// `-u root`, `-Eu root`, `--user root`, or an abbreviation like `--us root`
-/// (getopt_long accepts any unambiguous prefix). `-uroot` and `--user=root`
-/// carry the value inline.
-fn takes_next_word(opt: &str, shorts: &str, longs: &[&str]) -> bool {
-    match opt.strip_prefix("--") {
+/// A wrapper option that takes a value: its name (the short letter or the
+/// full long name) and the value, inline (`-uroot`, `--user=root`) or the
+/// next word (`-u root`, `-Eu root`, or `--us root`, since getopt_long
+/// accepts any unambiguous prefix).
+struct ValueOption<'a> {
+    name: &'a str,
+    value: Option<&'a str>,
+    uses_next_word: bool,
+}
+
+fn value_option<'a>(
+    opt: &'a str,
+    next: Option<&'a str>,
+    shorts: &str,
+    longs: &[&'static str],
+) -> Option<ValueOption<'a>> {
+    let (name, inline) = match opt.strip_prefix("--") {
         Some(long) => {
-            !long.is_empty() && !long.contains('=') && longs.iter().any(|l| l.starts_with(long))
+            let (given, inline) = match long.split_once('=') {
+                Some((given, value)) => (given, Some(value)),
+                None => (long, None),
+            };
+            let name = *longs
+                .iter()
+                .find(|l| !given.is_empty() && l.starts_with(given))?;
+            (name, inline)
         }
-        None => opt
-            .get(1..)
-            .and_then(|cluster| cluster.find(|c| shorts.contains(c)))
-            .is_some_and(|p| p + 2 == opt.len()),
+        None => {
+            let p = opt.get(1..)?.find(|c| shorts.contains(c))?;
+            let inline = &opt[p + 2..];
+            (&opt[p + 1..p + 2], (!inline.is_empty()).then_some(inline))
+        }
+    };
+    Some(ValueOption {
+        name,
+        value: inline.or(next),
+        uses_next_word: inline.is_none(),
+    })
+}
+
+/// Splits an `env -S` string the way env does: quotes, `\_` as a separator
+/// (a space inside double quotes), `\c` and `#` ending the string. `${VAR}`
+/// stays unexpanded. Strings env would reject are split leniently, since
+/// env then runs nothing.
+fn env_split_words(s: &str) -> Vec<String> {
+    fn escaped(c: char) -> char {
+        match c {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            'f' => '\x0c',
+            'v' => '\x0b',
+            c => c,
+        }
     }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            '#' if !in_word => break,
+            '\'' => {
+                in_word = true;
+                while let Some(q) = chars.next() {
+                    match q {
+                        '\'' => break,
+                        '\\' => match chars.next() {
+                            Some(n @ ('\\' | '\'')) => word.push(n),
+                            Some(n) => {
+                                word.push('\\');
+                                word.push(n);
+                            }
+                            None => word.push('\\'),
+                        },
+                        _ => word.push(q),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                while let Some(q) = chars.next() {
+                    match q {
+                        '"' => break,
+                        '\\' => match chars.next() {
+                            Some('_') => word.push(' '),
+                            Some(n) => word.push(escaped(n)),
+                            None => {}
+                        },
+                        _ => word.push(q),
+                    }
+                }
+            }
+            '\\' => match chars.next() {
+                Some('_') => {
+                    if in_word {
+                        words.push(std::mem::take(&mut word));
+                        in_word = false;
+                    }
+                }
+                Some('c') | None => break,
+                Some(n) => {
+                    in_word = true;
+                    word.push(escaped(n));
+                }
+            },
+            _ => {
+                in_word = true;
+                word.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// How far `strip_once` got: the index where the real program starts, or,
+/// for `env -S`, the rewritten words env really runs.
+enum Strip {
+    ProgramAt(usize),
+    EnvSplit(Vec<String>),
 }
 
 /// Drops env assignments and wrapper commands (`sudo`, `env`, `xargs`, ...)
-/// so the real program name comes first.
-fn strip_wrappers(words: &[String]) -> &[String] {
+/// so the real program name comes first. `env -S 'str'` has its option word
+/// replaced in place by the words of `str`, which env then goes on to parse.
+fn strip_wrappers(words: &[String]) -> Vec<String> {
+    let mut words = words.to_vec();
+    loop {
+        match strip_once(&words) {
+            Strip::ProgramAt(i) => {
+                words.drain(..i);
+                return words;
+            }
+            // Each rewrite drops the `-S` option word, so this terminates.
+            Strip::EnvSplit(next) => words = next,
+        }
+    }
+}
+
+fn strip_once(words: &[String]) -> Strip {
     let mut i = 0;
     while i < words.len() {
         let w = words[i].as_str();
@@ -229,19 +359,30 @@ fn strip_wrappers(words: &[String]) -> &[String] {
         // Skip the wrapper's own options and their values. A bare `-` is
         // env's `-i`.
         while let Some(opt) = words.get(i).filter(|o| o.starts_with('-')) {
+            let opt_start = i;
             i += 1;
             if opt == "--" {
                 break;
             }
-            if takes_next_word(opt, shorts, longs) {
+            let next = words.get(i).map(String::as_str);
+            let Some(option) = value_option(opt, next, shorts, longs) else {
+                continue;
+            };
+            if option.uses_next_word {
                 i += 1;
+            }
+            if wrapper == "env" && matches!(option.name, "S" | "split-string") {
+                let mut env = words[..opt_start].to_vec();
+                env.extend(env_split_words(option.value.unwrap_or("")));
+                env.extend_from_slice(&words[i.min(words.len())..]);
+                return Strip::EnvSplit(env);
             }
         }
         if wrapper == "timeout" {
             i += 1; // duration
         }
     }
-    &words[i.min(words.len())..]
+    Strip::ProgramAt(i.min(words.len()))
 }
 
 /// Output redirections in a segment as (truncates, target).
@@ -749,7 +890,6 @@ mod tests {
             "env -- rm -rf ~",
             "env -i FOO=1 rm -rf ~",
             "env - rm -rf ~",
-            "env -S 'x' rm -rf ~",
             "doas -a style rm -rf /",
             "sudo -a type rm -rf ~",
             "sudo -c class rm -rf ~",
@@ -777,6 +917,55 @@ mod tests {
         }
         assert!(destructive("sudo -D /tmp rm -rf build"));
         assert!(destructive("xargs -L 1 rm -rf build"));
+    }
+
+    #[test]
+    fn env_split_string_is_judged_as_a_command() {
+        for cmd in [
+            "env -S 'rm -rf ~'",
+            "env -S\"rm -rf /\"",
+            "env -vS 'rm -rf ~'",
+            "env --split-string='rm -rf ~'",
+            "env --split-string 'sudo rm -rf /'",
+            "env --split='rm -rf ~'",
+            "env -S 'rm -rf' ~",
+            "env -S rm -rf ~",
+            "env -S '-u FOO rm -rf ~'",
+            "env -S 'rm\\_-rf\\_~'",
+            "env -S 'env -S \"rm -rf ~\"'",
+            "sudo env -S 'rm -rf /'",
+            "FOO=1 env -i -S 'rm -rf ~'",
+        ] {
+            assert!(blocked(cmd), "{cmd}");
+        }
+        assert!(destructive("env -S 'rm -rf build'"));
+        assert!(destructive("env -S 'rm -rf' build"));
+        assert_eq!(classify("env -S 'cargo test'", &cfg()), Verdict::Safe);
+        // Words before `-S` keep applying.
+        assert!(blocked("sudo env -u X -S 'rm -rf' /"));
+        assert!(blocked("env -S '-C / rm' -rf ~"));
+        // env does not expand `~` in the string, so this is a literal `./~`;
+        // blocking it anyway is the deliberate, conservative choice.
+        assert!(blocked("env -S 'rm -rf ~'"));
+        // env's own string rules, not the shell's.
+        assert!(blocked("env -S 'rm -rf /\\c'"));
+        assert!(blocked("env -S 'rm -rf ${HOME}\\c ignored'"));
+        assert!(blocked("env -S '\"rm\" -rf / # comment'"));
+        assert_eq!(classify("env -S '# rm -rf /'", &cfg()), Verdict::Safe);
+        assert_eq!(
+            classify("env -S 'echo a > f; rm -rf /'", &cfg()),
+            Verdict::Safe
+        );
+        // Nesting has no depth limit to slip past.
+        assert!(blocked(
+            "env -S 'env -S \"env -S \\\"env -S rm -rf ~\\\"\"'"
+        ));
+        // The split string is the program; what follows is its arguments.
+        assert_eq!(classify("env -S 'echo' rm -rf ~", &cfg()), Verdict::Safe);
+        assert!(mutates("env -S 'touch a'"));
+        // Arguments after the split string keep their word boundaries.
+        assert!(destructive("env -S 'rm -rf' \"it's a dir\""));
+        assert_eq!(classify("env -S 'echo' \"it's ~\"", &cfg()), Verdict::Safe);
     }
 
     #[test]
