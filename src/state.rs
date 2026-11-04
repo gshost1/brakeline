@@ -271,6 +271,9 @@ pub struct SessionState {
     /// `None` in records written before it existed.
     pub active_secs: Option<u64>,
     pub tool_calls: u64,
+    /// Allowed calls over the session's life; unlike `tool_calls`, a budget
+    /// reset does not clear it.
+    pub lifetime_calls: u64,
     /// Bumped whenever the agent changes files; loop counters only compare
     /// calls within the same epoch.
     pub epoch: u64,
@@ -521,8 +524,11 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => GroupState::default(),
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
+        let before = group.clone();
         let result = f(&mut group);
-        write_atomic(&path, &serde_json::to_vec_pretty(&group)?)?;
+        if group != before {
+            write_atomic(&path, &serde_json::to_vec_pretty(&group)?)?;
+        }
         Ok(result)
     }
 
@@ -579,10 +585,13 @@ impl Store {
                     .ok()
                     .and_then(|t| t.elapsed().ok())
                     .is_some_and(|age| age > old);
-                if stale && path.extension().is_some_and(|e| e == "json") {
-                    let _guard = lock(&path.with_extension("lock"))?;
+                // The lock file stays: unlinking it while a hook waits on it
+                // would let two writers in at once.
+                if stale
+                    && path.extension().is_some_and(|e| e == "json")
+                    && let Ok(_guard) = lock(&path.with_extension("lock"))
+                {
                     let _ = fs::remove_file(&path);
-                    let _ = fs::remove_file(path.with_extension("lock"));
                 }
             }
         }

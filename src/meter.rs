@@ -75,8 +75,8 @@ pub struct DroidTotals {
     /// Token counters and credits; `cost_usd` is always zero here. Includes
     /// the subagents this session started.
     pub usage: Usage,
-    /// The same, for this session alone.
-    pub own: Usage,
+    /// The same, for this session alone; `None` when Droid did not say.
+    pub own: Option<Usage>,
     pub model: String,
 }
 
@@ -119,11 +119,13 @@ pub fn read_droid_totals(settings: &Path) -> Result<DroidTotals> {
             ..Usage::default()
         }
     };
-    let own = v.get("tokenUsage").or_else(|| v.get("inclusiveTokenUsage"));
+    // No fallback to the inclusive figure: it holds subagents that report
+    // their own use to the group too.
+    let own = v.get("tokenUsage").map(read);
     let inclusive = v.get("inclusiveTokenUsage").or_else(|| v.get("tokenUsage"));
     Ok(DroidTotals {
         usage: read(inclusive.unwrap_or(&Value::Null)),
-        own: read(own.unwrap_or(&Value::Null)),
+        own,
         model: v
             .get("model")
             .and_then(Value::as_str)
@@ -388,7 +390,7 @@ mod tests {
                 output_tokens: output,
                 ..Usage::default()
             },
-            own: Usage::default(),
+            own: None,
             model: model.to_string(),
         };
         let mut raw = Usage::default();

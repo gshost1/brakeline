@@ -182,24 +182,32 @@ impl Engine<'_> {
                         // Budgets only see use go up, even if Droid's
                         // counters restart.
                         s.usage = meter::at_least(&now, &s.usage);
-                        own = Some(totals.own);
+                        own = totals.own;
                     }
-                    let root = s
-                        .root
-                        .get_or_insert_with(|| droid_root(self.store, id, path))
-                        .clone();
-                    if let Some(own) = own {
+                    // Cached only once the chain reaches a known top, so a
+                    // parent not seen yet cannot split the group in two.
+                    if s.root.is_none() {
+                        s.root = droid_root(self.store, id, path);
+                    }
+                    if let (Some(root), Some(own)) = (s.root.clone(), own) {
                         let me = GroupUse {
                             factory_credits: own.factory_credits,
                             output_tokens: own.output_tokens,
-                            tool_calls: s.tool_calls,
+                            // Including this call; lifetime, so a budget reset
+                            // of this session does not lower the group's sum.
+                            tool_calls: s.lifetime_calls.max(s.tool_calls) + 1,
                         };
                         // An unsaved group must not block work: budgets
                         // then fall back to this session alone.
                         group = self
                             .store
                             .with_group(&root, |g| {
-                                g.members.insert(id.to_string(), me);
+                                // Only up: a half-written or restarted counter
+                                // must not lower what the group has used.
+                                let e = g.members.entry(id.to_string()).or_default();
+                                e.factory_credits = e.factory_credits.max(me.factory_credits);
+                                e.output_tokens = e.output_tokens.max(me.output_tokens);
+                                e.tool_calls = e.tool_calls.max(me.tool_calls);
                                 (g.total(), g.members.len())
                             })
                             .ok();
@@ -242,6 +250,7 @@ impl Engine<'_> {
             }
 
             s.tool_calls += 1;
+            s.lifetime_calls = s.lifetime_calls.max(s.tool_calls - 1) + 1;
             s.consecutive_denials = 0;
             s.remember(fp, loops.window as usize);
             if infer {
@@ -348,27 +357,33 @@ fn unsaved_notice(outcome: Outcome, save_err: Option<anyhow::Error>) -> Outcome 
 /// The top of the chain of Droid sessions that spawned session `id`, by
 /// `callingSessionId`: a parent brakeline has seen already supplies its own
 /// root; otherwise the parent's transcript, next to this one, is read.
-fn droid_root(store: &Store, id: &str, transcript: &Path) -> String {
+/// `None` when the chain cannot be followed to its top yet.
+fn droid_root(store: &Store, id: &str, transcript: &Path) -> Option<String> {
     let Some(mut parent) = meter::droid_calling_session(transcript) else {
-        return id.to_string();
+        return Some(id.to_string());
     };
-    let dir = transcript.parent();
+    let dir = transcript.parent()?;
     for _ in 0..16 {
         if let Ok(Some(p)) = store.load(&parent)
             && let Some(root) = p.root
         {
-            return root;
+            return Some(root);
         }
         // Only a plain id may name a file next to this transcript.
-        let next = dir
-            .filter(|_| sanitize_id(&parent) == parent)
-            .and_then(|d| meter::droid_calling_session(&d.join(format!("{parent}.jsonl"))));
-        match next {
+        if sanitize_id(&parent) != parent {
+            return None;
+        }
+        let file = dir.join(format!("{parent}.jsonl"));
+        if !file.is_file() {
+            return None;
+        }
+        match meter::droid_calling_session(&file) {
+            None => return Some(parent),
             Some(next) if next != parent && next != id => parent = next,
-            _ => break,
+            Some(_) => return None,
         }
     }
-    parent
+    None
 }
 
 /// A gap between hook events longer than this is idle time (the agent is
@@ -1046,6 +1061,20 @@ mod tests {
         }
         // The rest of the mission stops at its next call.
         assert!(matches!(call("orch", 1), Outcome::Stop(_)));
+        // A half-written settings file (zeros) does not lower the sum.
+        session("worker", Some("orch"), 0, 0);
+        assert!(matches!(call("orch", 2), Outcome::Stop(_)));
+        // A session whose parent brakeline has not seen, and whose parent's
+        // transcript is not there, joins no group until the chain resolves.
+        session("lost", Some("gone"), 5, 5);
+        assert!(is_allow(&call("lost", 0)));
+        assert_eq!(h.store.load("lost").unwrap().unwrap().root, None);
+        session("gone", None, 1, 1);
+        assert!(is_allow(&call("lost", 1)));
+        assert_eq!(
+            h.store.load("lost").unwrap().unwrap().root.as_deref(),
+            Some("gone")
+        );
     }
 
     #[test]
