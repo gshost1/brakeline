@@ -112,16 +112,9 @@ impl Engine<'_> {
             _ => Ok(Outcome::Allow(None)),
         };
         let outcome = outcome.unwrap_or_else(|err| self.fallback(input, &err));
-        let Some(notice) = &self.notice else {
-            return outcome;
-        };
-        match outcome {
-            Outcome::Allow(msg) => Outcome::Allow(Some(match msg {
-                Some(m) => format!("{notice}\n{m}"),
-                None => notice.clone(),
-            })),
-            Outcome::Deny(r) => Outcome::Deny(format!("{r}\n{notice}")),
-            Outcome::Stop(r) => Outcome::Stop(format!("{r}\n{notice}")),
+        match &self.notice {
+            Some(notice) => with_message(outcome, notice),
+            None => outcome,
         }
     }
 

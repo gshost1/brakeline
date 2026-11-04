@@ -114,6 +114,11 @@ pub fn read_droid_totals(settings: &Path) -> Result<DroidTotals> {
 /// now and added to `raw.cost_usd`, so the cost only ever goes up and past
 /// use keeps the price it was billed at.
 pub fn accumulate_droid(raw: &mut Usage, totals: &DroidTotals, cfg: &Config) {
+    // A reading with no model is a half-written file; the next one will
+    // include this growth anyway.
+    if totals.model.is_empty() {
+        return;
+    }
     let t = &totals.usage;
     let growth = [
         t.input_tokens.saturating_sub(raw.input_tokens),
@@ -121,16 +126,17 @@ pub fn accumulate_droid(raw: &mut Usage, totals: &DroidTotals, cfg: &Config) {
         t.cache_write_tokens.saturating_sub(raw.cache_write_tokens),
         t.cache_read_tokens.saturating_sub(raw.cache_read_tokens),
     ];
+    // An unknown model counts tokens but no cost, as transcripts do.
     if let Some(p) = cfg.price_for(&totals.model) {
         raw.cost_usd += cost(&growth, p);
     }
-    // Track the reported counters as-is, so if they ever restart lower, later
-    // growth is priced from there rather than ignored.
-    raw.input_tokens = t.input_tokens;
-    raw.output_tokens = t.output_tokens;
-    raw.cache_write_tokens = t.cache_write_tokens;
-    raw.cache_read_tokens = t.cache_read_tokens;
-    raw.factory_credits = t.factory_credits;
+    // Counters only move up: a low reading (a file caught mid-rewrite) must
+    // not make the next normal reading count the whole session again.
+    raw.input_tokens = raw.input_tokens.max(t.input_tokens);
+    raw.output_tokens = raw.output_tokens.max(t.output_tokens);
+    raw.cache_write_tokens = raw.cache_write_tokens.max(t.cache_write_tokens);
+    raw.cache_read_tokens = raw.cache_read_tokens.max(t.cache_read_tokens);
+    raw.factory_credits = raw.factory_credits.max(t.factory_credits);
 }
 
 /// Dollar cost of [input, output, cache write, cache read] tokens.
@@ -369,10 +375,17 @@ mod tests {
         assert!((raw.cost_usd - 25.0).abs() < 1e-9, "{}", raw.cost_usd);
         accumulate_droid(&mut raw, &totals("claude-haiku-5", 2_000_000), &cfg);
         assert!((raw.cost_usd - 30.0).abs() < 1e-9, "{}", raw.cost_usd);
-        // Counters that restart lower never reduce the cost; growth from the
-        // new base is still counted.
+        // A low reading (file caught mid-rewrite) neither lowers the cost
+        // nor makes the next normal reading count the session again.
         accumulate_droid(&mut raw, &totals("claude-opus-5", 0), &cfg);
-        accumulate_droid(&mut raw, &totals("claude-opus-5", 1_000_000), &cfg);
+        accumulate_droid(&mut raw, &totals("claude-opus-5", 2_000_000), &cfg);
+        assert!((raw.cost_usd - 30.0).abs() < 1e-9, "{}", raw.cost_usd);
+        assert_eq!(raw.output_tokens, 2_000_000);
+        // A reading with no model is skipped; its growth is priced once the
+        // model is back.
+        accumulate_droid(&mut raw, &totals("", 3_000_000), &cfg);
+        assert_eq!(raw.output_tokens, 2_000_000);
+        accumulate_droid(&mut raw, &totals("claude-opus-5", 3_000_000), &cfg);
         assert!((raw.cost_usd - 55.0).abs() < 1e-9, "{}", raw.cost_usd);
     }
 

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use crate::state::write_atomic;
+use crate::state::write_atomic_preserving;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
@@ -161,7 +161,7 @@ pub fn install(path: &Path, command: &str, target: Target, write: bool) -> Resul
             let backup = path.with_extension("json.brakeline-backup");
             if backup.symlink_metadata().is_ok() {
                 eprintln!(
-                    "kept existing backup {} (settings from before the first brakeline install)",
+                    "kept existing backup {} from an earlier brakeline install",
                     backup.display()
                 );
             } else {
@@ -170,7 +170,7 @@ pub fn install(path: &Path, command: &str, target: Target, write: bool) -> Resul
                 eprintln!("original settings backed up to {}", backup.display());
             }
         }
-        write_atomic(path, text.as_bytes())?;
+        write_atomic_preserving(path, text.as_bytes())?;
     }
     Ok(text)
 }

@@ -40,16 +40,32 @@ pub fn ensure_private_dir(dir: &Path) -> Result<()> {
 }
 
 /// Write via a temp file and rename, so a crash never leaves a torn file.
-/// A symlinked `path` is written through to its target (the link stays), and
-/// an existing file keeps its permissions; new files are private (0600).
+/// The result is private (0600). For brakeline's own files.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    replace_file(path, bytes, None)
+}
+
+/// Like `write_atomic`, for a file the user owns (agent settings): a
+/// symlinked `path` is written through to its target, so the link stays,
+/// and an existing file keeps its permissions.
+pub fn write_atomic_preserving(path: &Path, bytes: &[u8]) -> Result<()> {
     let path = resolve_symlinks(path)?;
     let mode = fs::metadata(&path).ok().map(|m| m.permissions());
-    // Next to the target, so the rename stays on one filesystem.
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    let _ = fs::remove_file(&tmp);
+    replace_file(&path, bytes, mode)
+}
+
+fn replace_file(path: &Path, bytes: &[u8], mode: Option<fs::Permissions>) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    // Next to the target, so the rename stays on one filesystem. Unique per
+    // call, so concurrent writers never touch each other's temp file.
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let result = write_new(&tmp, bytes, mode).and_then(|()| {
-        fs::rename(&tmp, &path).with_context(|| format!("cannot replace {}", path.display()))
+        fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))
     });
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -95,6 +111,14 @@ fn resolve_symlinks(path: &Path) -> Result<PathBuf> {
         }
     }
     anyhow::bail!("too many levels of symbolic links at {}", path.display())
+}
+
+fn new_state(id: &str) -> SessionState {
+    SessionState {
+        session_id: id.to_string(),
+        started_at: now_secs(),
+        ..SessionState::default()
+    }
 }
 
 /// Holds an exclusive advisory lock until dropped.
@@ -377,15 +401,18 @@ impl Store {
     }
 
     /// Runs `f` on the session state under an exclusive lock and persists it.
+    /// Fails before running `f` if the lock cannot be taken.
     pub fn with_session<R>(
         &self,
         id: &str,
         f: impl FnOnce(&mut SessionState) -> Result<R>,
     ) -> Result<R> {
-        match self.update_session(id, f)? {
-            (result, None) => Ok(result),
-            (_, Some(err)) => Err(err),
-        }
+        let path = self.session_path(id);
+        let _guard = lock(&path.with_extension("lock"))?;
+        let mut state = read_state(&path)?.unwrap_or_else(|| new_state(id));
+        let result = f(&mut state)?;
+        write_atomic(&path, &serde_json::to_vec_pretty(&state)?)?;
+        Ok(result)
     }
 
     /// Like `with_session`, but a state that was read yet could not be saved
@@ -399,13 +426,14 @@ impl Store {
     ) -> Result<(R, Option<anyhow::Error>)> {
         let path = self.session_path(id);
         // Without the lock, a concurrent call may race us; deciding from the
-        // last saved state is still better than not deciding at all.
+        // last saved state is still better than not deciding at all. With no
+        // lock and no saved state there is nothing to decide from.
         let guard = lock(&path.with_extension("lock"));
-        let mut state = read_state(&path)?.unwrap_or_else(|| SessionState {
-            session_id: id.to_string(),
-            started_at: now_secs(),
-            ..SessionState::default()
-        });
+        let mut state = match (read_state(&path)?, &guard) {
+            (Some(state), _) => state,
+            (None, Ok(_)) => new_state(id),
+            (None, Err(err)) => anyhow::bail!("cannot lock session state: {err:#}"),
+        };
         let result = f(&mut state)?;
         let saved = guard.and_then(|_guard| {
             let bytes = serde_json::to_vec_pretty(&state)?;
@@ -523,10 +551,14 @@ mod tests {
         let fresh = dir.path().join("fresh.json");
         write_atomic(&fresh, b"{}").unwrap();
         assert_eq!(mode(&fresh), 0o600);
+        // brakeline's own files become private even if they weren't.
+        fs::set_permissions(&fresh, fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic(&fresh, b"{}").unwrap();
+        assert_eq!(mode(&fresh), 0o600);
         let shared = dir.path().join("shared.json");
         fs::write(&shared, b"old").unwrap();
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o640)).unwrap();
-        write_atomic(&shared, b"new").unwrap();
+        write_atomic_preserving(&shared, b"new").unwrap();
         assert_eq!(mode(&shared), 0o640);
         assert_eq!(fs::read(&shared).unwrap(), b"new");
         // No temp files left behind.
@@ -543,7 +575,7 @@ mod tests {
         let link = dir.path().join("link.json");
         std::os::unix::fs::symlink(&real, &mid).unwrap();
         std::os::unix::fs::symlink("mid.json", &link).unwrap();
-        write_atomic(&link, b"new").unwrap();
+        write_atomic_preserving(&link, b"new").unwrap();
         assert!(
             fs::symlink_metadata(&link)
                 .unwrap()
@@ -554,7 +586,48 @@ mod tests {
         assert_eq!(fs::read(&real).unwrap(), b"new");
         let lo = dir.path().join("loop");
         std::os::unix::fs::symlink("loop", &lo).unwrap();
-        assert!(write_atomic(&lo, b"x").is_err());
+        assert!(write_atomic_preserving(&lo, b"x").is_err());
+    }
+
+    #[test]
+    fn parallel_writes_to_one_path_never_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let path = &path;
+                scope.spawn(move || {
+                    for _ in 0..50 {
+                        write_atomic(path, format!("{i}").as_bytes()).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_lock_and_no_saved_state_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data")).unwrap();
+        let sessions = dir.path().join("data").join("sessions");
+        fs::set_permissions(&sessions, fs::Permissions::from_mode(0o500)).unwrap();
+        let writable = fs::write(sessions.join("probe"), b"").is_ok();
+        let mut ran = false;
+        let unlocked = store.update_session("new", |_| {
+            ran = true;
+            Ok(())
+        });
+        let reset = store.with_session("new", |_| Ok(()));
+        fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700)).unwrap();
+        if writable {
+            return; // running as root: permissions don't block writes
+        }
+        assert!(unlocked.is_err());
+        assert!(!ran, "decided from a blank state");
+        assert!(reset.is_err());
     }
 
     #[test]
