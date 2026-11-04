@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use crate::state::write_atomic;
+use crate::state::{now_secs, write_atomic, write_atomic_preserving};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
@@ -135,11 +135,20 @@ pub fn merge_hooks(mut settings: Value, command: &str, target: Target) -> Result
 
 #[cfg(test)]
 pub fn install_claude(path: &Path, command: &str, write: bool) -> Result<String> {
-    install(path, command, Target::Claude, write)
+    install(path, command, Target::Claude, false, write)
 }
 
 /// Returns the merged settings text; writes it (with a backup) when `write`.
-pub fn install(path: &Path, command: &str, target: Target, write: bool) -> Result<String> {
+/// `project` means `path` is inside a repo, which is untrusted: symlinks
+/// there are replaced, not followed, and a backup file the repo ships can't
+/// stand in for a real one.
+pub fn install(
+    path: &Path,
+    command: &str,
+    target: Target,
+    project: bool,
+    write: bool,
+) -> Result<String> {
     let existing = match std::fs::read_to_string(path) {
         Ok(text) if text.trim().is_empty() => Value::Null,
         Ok(text) => serde_json::from_str(&text)
@@ -155,11 +164,41 @@ pub fn install(path: &Path, command: &str, target: Target, write: bool) -> Resul
             std::fs::create_dir_all(parent)?;
         }
         if had_file {
-            let backup = path.with_extension("json.brakeline-backup");
-            std::fs::copy(path, &backup)
-                .with_context(|| format!("cannot back up to {}", backup.display()))?;
+            // The first backup holds the settings from before brakeline was
+            // ever installed; later installs must not replace it with a file
+            // that already has brakeline's hooks merged in.
+            let mut backup = path.with_extension("json.brakeline-backup");
+            let existing = backup.symlink_metadata().ok();
+            if existing
+                .as_ref()
+                .is_some_and(|m| m.file_type().is_symlink())
+            {
+                anyhow::bail!(
+                    "{} is a symlink; remove it and run the install again",
+                    backup.display()
+                );
+            }
+            if project && existing.is_some() {
+                backup = path.with_extension(format!("json.brakeline-backup.{}", now_secs()));
+            }
+            if !project && existing.is_some() {
+                eprintln!(
+                    "kept existing backup {} from an earlier brakeline install",
+                    backup.display()
+                );
+            } else {
+                let original = std::fs::read(path)
+                    .with_context(|| format!("cannot read {}", path.display()))?;
+                write_atomic(&backup, &original)
+                    .with_context(|| format!("cannot back up to {}", backup.display()))?;
+                eprintln!("original settings backed up to {}", backup.display());
+            }
         }
-        write_atomic(path, text.as_bytes())?;
+        if project {
+            write_atomic(path, text.as_bytes())?;
+        } else {
+            write_atomic_preserving(path, text.as_bytes())?;
+        }
     }
     Ok(text)
 }
@@ -233,6 +272,89 @@ mod tests {
             hook_command(Path::new("/Users/a b/brakeline")),
             "'/Users/a b/brakeline' hook"
         );
+    }
+
+    #[test]
+    fn reinstall_keeps_the_original_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"theme\":\"dark\"}").unwrap();
+        install_claude(&path, "brakeline hook", true).unwrap();
+        install_claude(&path, "/other/brakeline hook", true).unwrap();
+        let backup = std::fs::read_to_string(path.with_extension("json.brakeline-backup")).unwrap();
+        assert_eq!(backup, "{\"theme\":\"dark\"}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_writes_through_a_symlink_and_keeps_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles/claude-settings.json");
+        std::fs::create_dir_all(dotfiles.parent().unwrap()).unwrap();
+        std::fs::write(&dotfiles, "{\"env\":{\"TOKEN\":\"x\"}}").unwrap();
+        std::fs::set_permissions(&dotfiles, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let path = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Relative link, as dotfile managers often make.
+        std::os::unix::fs::symlink("../dotfiles/claude-settings.json", &path).unwrap();
+
+        install_claude(&path, "brakeline hook", true).unwrap();
+
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+        let target: Value =
+            serde_json::from_str(&std::fs::read_to_string(&dotfiles).unwrap()).unwrap();
+        assert_eq!(target["env"]["TOKEN"], "x");
+        assert!(target["hooks"]["PreToolUse"].is_array());
+        let mode = std::fs::metadata(&dotfiles).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let backup = path.with_extension("json.brakeline-backup");
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_install_stays_inside_the_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.json");
+        std::fs::write(&outside, "{\"keep\":true}").unwrap();
+        let repo = dir.path().join("repo/.claude");
+        std::fs::create_dir_all(&repo).unwrap();
+        let path = repo.join("settings.json");
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        // A backup the repo ships must not stop a real one being taken.
+        std::fs::write(repo.join("settings.json.brakeline-backup"), "").unwrap();
+        install(&path, "brakeline hook", Target::Claude, true, true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "{\"keep\":true}"
+        );
+        assert!(!path.symlink_metadata().unwrap().file_type().is_symlink());
+        let backups: Vec<_> = std::fs::read_dir(&repo)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with("settings.json.brakeline-backup."))
+            .collect();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join(&backups[0])).unwrap(),
+            "{\"keep\":true}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_backup_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        std::os::unix::fs::symlink(&victim, path.with_extension("json.brakeline-backup")).unwrap();
+        assert!(install_claude(&path, "brakeline hook", true).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
     }
 
     #[test]
