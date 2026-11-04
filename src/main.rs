@@ -184,6 +184,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 if budget {
                     s.tool_calls = 0;
                     s.started_at = now_secs();
+                    s.active_secs = Some(0);
                     s.usage = Default::default();
                     s.usage_baseline = s.usage_raw.clone();
                     s.warned.clear();
@@ -432,6 +433,7 @@ fn status(session: Option<String>, json: bool) -> Result<ExitCode> {
         );
         println!("started      {}", ago(s.started_at));
         println!("last seen    {}", ago(s.last_seen));
+        println!("active       {} min", s.active_secs.unwrap_or(0) / 60);
         println!("tool calls   {}", s.tool_calls);
         println!("refusals     {} total", s.total_denials);
         if let Some(d) = &s.last_denial {

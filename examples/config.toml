@@ -22,6 +22,7 @@ progress_tools = ["Edit", "Write", "MultiEdit", "NotebookEdit", "Create", "Apply
 [budget]
 # Per session. Set a value to 0 to disable that budget.
 max_tool_calls = 800
+# Active minutes: gaps over 30 min between calls (waiting on you, a resumed chat) do not count.
 max_session_minutes = 480
 max_cost_usd = 50.0
 # max_output_tokens = 2000000

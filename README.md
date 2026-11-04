@@ -7,7 +7,7 @@
 **A seatbelt for unattended coding agents.** brakeline is a single native binary that sits in your agent's hook pipeline and does four things on every tool call, in about 6 ms:
 
 1. **Stops loops.** If the agent repeats the same call with no file changes in between, or retries a failing command again and again, the call is refused with an explanation the agent can act on. If it keeps getting refused, the run is stopped.
-2. **Enforces budgets.** Per-session caps on estimated spend (metered from the transcript), output tokens, tool calls, and wall-clock time. You get a warning at 80% and a hard stop at 100%.
+2. **Enforces budgets.** Per-session caps on estimated spend (metered from the transcript), output tokens, tool calls, and active time (idle gaps over 30 minutes do not count). You get a warning at 80% and a hard stop at 100%.
 3. **Blocks catastrophic commands.** `rm -rf ~`, `rm -rf $UNSET_VAR/`, `find / -delete`, `dd of=/dev/disk2`, `mkfs`, force pushes, and your own patterns.
 4. **Snapshots before destructive commands.** Before `rm`, `mv`, `> file` overwrites, `git reset --hard`, `git restore`, `git checkout -- .`, `git clean`, `sed -i`, `find -delete`/`-exec rm` and similar, it saves tracked *and untracked* files as a git object. Then `brakeline restore <id>` brings them back.
 
