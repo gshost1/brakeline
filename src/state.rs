@@ -274,6 +274,9 @@ pub struct SessionState {
     /// `None` in records written before it existed.
     pub active_secs: Option<u64>,
     pub tool_calls: u64,
+    /// Allowed calls over the session's life; unlike `tool_calls`, a budget
+    /// reset does not clear it.
+    pub lifetime_calls: u64,
     /// Bumped whenever the agent changes files; loop counters only compare
     /// calls within the same epoch.
     pub epoch: u64,
@@ -293,6 +296,59 @@ pub struct SessionState {
     /// in use when it was seen; and this record as of the last budget reset.
     pub usage_raw: Usage,
     pub usage_baseline: Usage,
+    /// The session this one was spawned from, followed to the top (Droid's
+    /// `callingSessionId`): a mission's orchestrator, or the session that
+    /// started a subagent. Its own id when it has no parent; `None` until
+    /// resolved. Budgets count the whole group under this root.
+    pub root: Option<String>,
+}
+
+/// What one session of a group has used by itself, children excluded.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupUse {
+    pub factory_credits: u64,
+    pub output_tokens: u64,
+    pub tool_calls: u64,
+}
+
+impl GroupUse {
+    fn add(&mut self, o: &GroupUse) {
+        self.factory_credits += o.factory_credits;
+        self.output_tokens += o.output_tokens;
+        self.tool_calls += o.tool_calls;
+    }
+}
+
+/// Sessions spawned from one root (a Droid mission and its workers), so a
+/// budget covers the whole run and not each worker separately.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupState {
+    pub members: std::collections::BTreeMap<String, GroupUse>,
+    /// The sum as of the last `brakeline reset --budget` of a member.
+    pub baseline: GroupUse,
+}
+
+impl GroupState {
+    pub fn sum(&self) -> GroupUse {
+        let mut t = GroupUse::default();
+        for m in self.members.values() {
+            t.add(m);
+        }
+        t
+    }
+
+    /// Use since the last budget reset.
+    pub fn total(&self) -> GroupUse {
+        let s = self.sum();
+        let b = &self.baseline;
+        GroupUse {
+            factory_credits: s.factory_credits.saturating_sub(b.factory_credits),
+            output_tokens: s.output_tokens.saturating_sub(b.output_tokens),
+            tool_calls: s.tool_calls.saturating_sub(b.tool_calls),
+        }
+    }
 }
 
 const MAX_FAILURE_ENTRIES: usize = 64;
@@ -419,6 +475,7 @@ impl Store {
     pub fn open(root: PathBuf) -> Result<Self> {
         ensure_private_dir(&root)?;
         ensure_private_dir(&root.join("sessions"))?;
+        ensure_private_dir(&root.join("groups"))?;
         Ok(Self { root })
     }
 
@@ -478,6 +535,41 @@ impl Store {
         Ok((result, saved.err()))
     }
 
+    fn group_path(&self, root: &str) -> PathBuf {
+        self.root
+            .join("groups")
+            .join(format!("{}.json", sanitize_id(root)))
+    }
+
+    pub fn group_exists(&self, root: &str) -> bool {
+        self.group_path(root).exists()
+    }
+
+    /// Runs `f` on the group under `root` with an exclusive lock and saves it.
+    /// Take a group lock only while holding at most a session lock, never
+    /// the other way round.
+    pub fn with_group<R>(&self, root: &str, f: impl FnOnce(&mut GroupState) -> R) -> Result<R> {
+        let path = self.group_path(root);
+        let _guard = lock(&path.with_extension("lock"))?;
+        let mut group: GroupState = match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("{} is not a group record", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => GroupState::default(),
+            Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+        };
+        let before = group.clone();
+        let result = f(&mut group);
+        if group != before {
+            write_atomic(&path, &serde_json::to_vec_pretty(&group)?)?;
+        }
+        Ok(result)
+    }
+
+    pub fn load_group(&self, root: &str) -> Option<GroupState> {
+        let bytes = fs::read(self.group_path(root)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
     pub fn load(&self, id: &str) -> Result<Option<SessionState>> {
         read_state(&self.session_path(id))
     }
@@ -512,6 +604,28 @@ impl Store {
                     removed += 1;
                 }
                 let _ = fs::remove_file(path.with_extension("lock"));
+            }
+        }
+        // Groups are written on every call of a member, so an old file means
+        // the whole group has gone quiet.
+        let old = std::time::Duration::from_secs(days.saturating_mul(86_400));
+        if let Ok(entries) = fs::read_dir(self.root.join("groups")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let stale = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > old);
+                // The lock file stays: unlinking it while a hook waits on it
+                // would let two writers in at once.
+                if stale
+                    && path.extension().is_some_and(|e| e == "json")
+                    && let Ok(_guard) = lock(&path.with_extension("lock"))
+                {
+                    let _ = fs::remove_file(&path);
+                }
             }
         }
         Ok(removed)

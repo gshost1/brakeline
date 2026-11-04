@@ -191,6 +191,36 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 Ok(())
             })?;
+            // The group's members stopped on its budget too; they get the
+            // same fresh start. Done after the session lock is released, as
+            // hooks take a session lock before a group lock.
+            let root = store.load(&session)?.and_then(|s| s.root);
+            if budget
+                && let Some(root) = root
+                && store.group_exists(&root)
+            {
+                let members = store.with_group(&root, |g| {
+                    g.baseline = g.sum();
+                    g.members.keys().cloned().collect::<Vec<_>>()
+                })?;
+                for m in members.iter().filter(|m| **m != session && store.exists(m)) {
+                    store.with_session(m, |s| {
+                        if s.halted
+                            .as_deref()
+                            .is_some_and(|r| r.contains("budget reached"))
+                        {
+                            s.halted = None;
+                            s.consecutive_denials = 0;
+                        }
+                        s.warned.clear();
+                        Ok(())
+                    })?;
+                }
+                println!(
+                    "budget restarted for all {} sessions of group {root}.",
+                    members.len()
+                );
+            }
             println!("session {session} reset; tell the agent to continue.");
             Ok(ExitCode::SUCCESS)
         }
@@ -440,6 +470,19 @@ fn status(session: Option<String>, json: bool) -> Result<ExitCode> {
             println!("last refusal {d}");
         }
         println!("snapshots    {}", s.snapshots);
+        if let Some(root) = &s.root
+            && let Some(g) = store.load_group(root)
+            && g.members.len() > 1
+        {
+            let t = g.total();
+            println!(
+                "group        {} sessions under {root}: {} tool calls, {} output tokens, {} Factory credits",
+                g.members.len(),
+                t.tool_calls,
+                t.output_tokens,
+                t.factory_credits
+            );
+        }
         let u = &s.usage;
         println!(
             "tokens       in {} / out {} / cache write {} / cache read {}",

@@ -39,6 +39,7 @@ This registers `brakeline hook --agent droid` for `PreToolUse`, `PostToolUse` an
 
 - **Droid sends no hook event when a tool call fails.** In Droid mode, a call that never reports back is counted as failed. That happens at the turn's `Stop`, or when the next call starts more than 2 seconds later. Calls in the same parallel batch are not affected.
 - **Spend comes from Droid's own counters.** brakeline reads the running session totals Droid keeps next to the transcript (`<session>.settings.json`), so subagents are included. This also enables a `max_factory_credits` budget.
+- **A mission is one budget.** Mission workers, validators and subagents record which session started them. brakeline follows that chain to the top and checks Factory credits, output tokens and tool calls against the whole group, so a mission can't spread past a cap one worker at a time. The dollar estimate and the time budget stay per session.
 
 Tested live with `droid exec` 0.232.0: a force push was refused, a retry loop was refused after 3 failures and then stopped, and `git reset --hard && git clean -fd` was snapshotted and fully restored. Droid shows brakeline's snapshot notice to the user, not to the model.
 
