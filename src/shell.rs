@@ -762,6 +762,11 @@ fn strip_once(words: &[String]) -> Strip {
             i += 1;
             continue;
         }
+        // `function name { body }`: the body follows the name.
+        if w == "function" {
+            i += 2;
+            continue;
+        }
         let wrapper = basename(w);
         let Some((shorts, longs)) = wrapper_value_options(wrapper) else {
             break;
@@ -774,6 +779,10 @@ fn strip_once(words: &[String]) -> Strip {
             i += 1;
             if opt == "--" {
                 break;
+            }
+            // `command -v`/`-V` only looks the name up.
+            if wrapper == "command" && !opt.starts_with("--") && opt.contains(['v', 'V']) {
+                return Strip::ProgramAt(words.len());
             }
             let next = words.get(i).map(String::as_str);
             let Some(option) = value_option(opt, next, shorts, longs) else {
@@ -796,9 +805,41 @@ fn strip_once(words: &[String]) -> Strip {
     Strip::ProgramAt(i.min(words.len()))
 }
 
+/// Device paths that are streams or scratch space, not disks: writing them
+/// loses nothing.
+fn is_scratch_device(target: &str) -> bool {
+    matches!(
+        target,
+        "/dev/null"
+            | "/dev/zero"
+            | "/dev/random"
+            | "/dev/urandom"
+            | "/dev/stdin"
+            | "/dev/stdout"
+            | "/dev/stderr"
+            | "/dev/console"
+    ) || ["/dev/fd/", "/dev/tty", "/dev/pts/", "/dev/shm/"]
+        .iter()
+        .any(|p| target.starts_with(p))
+}
+
+/// Any other device file, such as a disk.
+fn is_raw_device(target: &str) -> bool {
+    target.starts_with("/dev/") && !is_scratch_device(target)
+}
+
+fn raw_device_write(target: &str, cfg: &ShellConfig, out: &mut Findings) {
+    let reason = format!("writes to the raw device `{target}`");
+    if cfg.block_catastrophic {
+        out.block(reason);
+    } else {
+        out.destructive(reason);
+    }
+}
+
 /// Redirect targets whose contents nobody needs back.
 fn is_scratch_target(target: &str) -> bool {
-    target.starts_with("/dev/")
+    is_scratch_device(target)
         || ["/tmp/", "/private/tmp/", "$TMPDIR", "${TMPDIR}"]
             .iter()
             .any(|p| target.starts_with(p))
@@ -811,9 +852,12 @@ fn analyze_segment(
     depth: usize,
     out: &mut Findings,
 ) {
+    if let Some((_, target)) = writes.iter().find(|(_, t)| is_raw_device(t)) {
+        raw_device_write(target, cfg, out);
+    }
     if let Some((_, target)) = writes
         .iter()
-        .find(|(truncates, t)| *truncates && !is_scratch_target(t))
+        .find(|(truncates, t)| *truncates && !is_scratch_target(t) && !is_raw_device(t))
     {
         out.destructive(format!("`> {target}` overwrites the file"));
     }
@@ -842,21 +886,31 @@ fn analyze_segment(
         "git" => analyze_git(args, cfg, out),
         "mv" => out.destructive("`mv` can overwrite files".into()),
         "unlink" | "shred" | "truncate" => out.destructive(format!("`{program}` removes data")),
-        "sed" | "perl"
-            if args.iter().any(|a| {
-                a.starts_with("-i") || a.starts_with("-pi") || a.starts_with("--in-place")
-            }) =>
-        {
+        "sed" | "perl" if edits_in_place(program, args) => {
             out.destructive(format!("`{program} -i` edits files in place"))
+        }
+        "tee" => analyze_tee(args, cfg, out),
+        "rsync" => {
+            if args
+                .iter()
+                .any(|a| a.starts_with("--delete") || a == "--del")
+            {
+                out.destructive("`rsync --delete` removes files at the destination".into());
+            } else if args.iter().any(|a| a == "--remove-source-files") {
+                out.destructive("`rsync --remove-source-files` deletes the sources".into());
+            }
         }
         "dd" => {
             if cfg.block_catastrophic
                 && args
                     .iter()
-                    .any(|a| a.starts_with("of=/dev/") && !a.starts_with("of=/dev/null"))
+                    .any(|a| a.strip_prefix("of=").is_some_and(is_raw_device))
             {
                 out.block("`dd` writing to a raw device".into());
-            } else if args.iter().any(|a| a.starts_with("of=")) {
+            } else if args
+                .iter()
+                .any(|a| a.strip_prefix("of=").is_some_and(|t| !is_scratch_target(t)))
+            {
                 out.destructive("`dd` overwrites its output file".into());
             }
         }
@@ -869,14 +923,29 @@ fn analyze_segment(
             if cfg.block_catastrophic
                 && args.iter().any(|a| {
                     let a = a.to_ascii_lowercase();
-                    a.starts_with("erase") || a == "zerodisk" || a == "randomdisk"
+                    a.starts_with("erase")
+                        || matches!(
+                            a.as_str(),
+                            "zerodisk"
+                                | "randomdisk"
+                                | "secureerase"
+                                | "partitiondisk"
+                                | "reformat"
+                                | "deletecontainer"
+                                | "deletevolume"
+                                | "splitpartition"
+                                | "mergepartitions"
+                        )
                 })
             {
-                out.block("`diskutil` erase".into());
+                out.block("`diskutil` erases or repartitions a disk".into());
             }
         }
-        "chmod" | "chown" => {
-            let recursive = args.iter().any(|a| a == "-R" || a == "--recursive");
+        "chmod" | "chown" | "chgrp" => {
+            let recursive = args.iter().any(|a| {
+                a == "--recursive"
+                    || (a.starts_with('-') && !a.starts_with("--") && a.contains('R'))
+            });
             if cfg.block_catastrophic
                 && recursive
                 && args
@@ -903,7 +972,7 @@ pub fn mutates(command: &str) -> bool {
         return true;
     }
     tokenize(command).0.iter().any(|segment| {
-        let redirects = segment.writes.iter().any(|(_, t)| !t.starts_with("/dev/"));
+        let redirects = segment.writes.iter().any(|(_, t)| !is_scratch_device(t));
         let words = strip_wrappers(&segment.words);
         let program = words.first().map(|w| basename(w)).unwrap_or("");
         let sub = words.get(1).map(String::as_str).unwrap_or("");
@@ -937,6 +1006,68 @@ pub fn mutates(command: &str) -> bool {
                     | ("pip" | "pip3" | "uv", "install" | "add")
             )
     })
+}
+
+/// `sed -i`, `sed -Ei.bak`, `perl -0pi`, `perl -lpi.bak`: an `i` anywhere in
+/// a short-option cluster, before an option whose value eats the rest.
+fn edits_in_place(program: &str, args: &[String]) -> bool {
+    // Options whose value is the rest of the cluster (or the next word).
+    let takes_value = if program == "sed" {
+        "efl"
+    } else {
+        "CDFIMVdeEmx"
+    };
+    args.iter().any(|a| {
+        if a.starts_with("--in-place") {
+            return true;
+        }
+        let Some(cluster) = a.strip_prefix('-').filter(|c| !c.starts_with('-')) else {
+            return false;
+        };
+        let mut chars = cluster.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == 'i' || (program == "sed" && c == 'I') {
+                return true;
+            }
+            if takes_value.contains(c) {
+                return false;
+            }
+            // perl's `-0777`, `-0x1F` and `-l12` take a number.
+            if program == "perl" && matches!(c, '0' | 'l') {
+                let hex = c == '0' && chars.next_if_eq(&'x').is_some();
+                while chars
+                    .next_if(|d| d.is_ascii_digit() || (hex && d.is_ascii_hexdigit()))
+                    .is_some()
+                {}
+            }
+        }
+        false
+    })
+}
+
+fn analyze_tee(args: &[String], cfg: &ShellConfig, out: &mut Findings) {
+    let mut append = false;
+    let mut targets = Vec::new();
+    let mut end_of_options = false;
+    for a in args {
+        if end_of_options || !a.starts_with('-') || a == "-" {
+            targets.push(a.as_str());
+        } else if a == "--" {
+            end_of_options = true;
+        } else if a == "--append" || (!a.starts_with("--") && a.contains('a')) {
+            append = true;
+        }
+    }
+    if let Some(t) = targets.iter().find(|t| is_raw_device(t)) {
+        raw_device_write(t, cfg, out);
+    }
+    if !append
+        && let Some(t) = targets
+            .iter()
+            .find(|t| **t != "-" && !is_scratch_target(t) && !is_raw_device(t))
+    {
+        out.destructive(format!("`tee {t}` overwrites the file"));
+    }
 }
 
 fn analyze_rm(args: &[String], cfg: &ShellConfig, out: &mut Findings) {
@@ -1059,7 +1190,8 @@ fn analyze_git(args: &[String], cfg: &ShellConfig, out: &mut Findings) {
         }
         "checkout" => {
             if has(&["--", ".", "-f", "-B", "-p", "--patch", "--theirs", "--ours"])
-                || has_prefix(&["--force"])
+                || has_prefix(&["--force", "--pathspec-from-file"])
+                || checkout_names_paths(rest)
             {
                 out.destructive("`git checkout` with paths or force discards changes".into());
             }
@@ -1101,6 +1233,51 @@ fn analyze_git(args: &[String], cfg: &ShellConfig, out: &mut Findings) {
         }
         _ => {}
     }
+}
+
+/// Whether `git checkout <rest>` restores files rather than switching
+/// branches. The classifier does not see the working tree, so this guesses
+/// from the operands: two or more mean `<tree-ish> <paths>`; a single one
+/// counts as a path if it cannot be a ref (see `looks_like_path`).
+fn checkout_names_paths(rest: &[String]) -> bool {
+    let mut operands = Vec::new();
+    let mut i = 0;
+    while let Some(a) = rest.get(i) {
+        i += 1;
+        if matches!(a.as_str(), "-b" | "-B" | "--orphan") {
+            i += 1; // the new branch name
+        } else if !a.starts_with('-') || a == "-" {
+            operands.push(a.as_str());
+        }
+    }
+    operands.len() >= 2 || operands.first().is_some_and(|a| looks_like_path(a))
+}
+
+/// A checkout operand that is a path rather than a branch, tag or commit.
+/// Git refs cannot end in `/`, contain `*?[:` or have a component starting
+/// with `.`, so those are paths. Otherwise a final component with a file
+/// extension (`main.rs`, `Cargo.toml`) is taken as a file; versions like
+/// `v1.2.3` or `2.x` are not. Extensionless files (`Makefile`) are missed.
+fn looks_like_path(a: &str) -> bool {
+    if a == "-" || a.is_empty() {
+        return false;
+    }
+    if a.starts_with(['/', ':']) || a.ends_with('/') || a.contains(['*', '?', '[']) {
+        return true;
+    }
+    if a.split('/').any(|c| c.starts_with('.')) {
+        return true;
+    }
+    if a.contains(['~', '^', '@']) {
+        return false;
+    }
+    let last = a.rsplit('/').next().unwrap_or(a);
+    last.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty()
+            && ext.starts_with(|c: char| c.is_ascii_alphabetic())
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            && !ext.eq_ignore_ascii_case("x")
+    })
 }
 
 fn is_catastrophic_target(target: &str) -> bool {
@@ -1146,10 +1323,15 @@ fn is_catastrophic_target(target: &str) -> bool {
     {
         return true;
     }
-    // A single user's home directory, e.g. /Users/alice or /home/bob.
-    for prefix in ["/Users/", "/home/"] {
-        if let Some(rest) = t.strip_prefix(prefix)
-            && !rest.is_empty()
+    // A single user's home directory or everything in it, e.g. /Users/alice,
+    // /home/bob/*, ~carol.
+    let home = t.strip_suffix("/*").map_or(t, |b| b.trim_end_matches('/'));
+    for prefix in ["/Users/", "/home/", "~"] {
+        if let Some(rest) = home.strip_prefix(prefix)
+            && rest
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
             && !rest.contains('/')
         {
             return true;
@@ -1670,6 +1852,199 @@ mod tests {
         ] {
             assert!(safe(cmd), "{cmd}");
         }
+    }
+
+    #[test]
+    fn single_home_globs_are_catastrophic() {
+        for cmd in [
+            "rm -rf /Users/alice/*",
+            "rm -rf /home/bob/*",
+            "rm -rf /home/bob/",
+            "rm -rf ~bob",
+            "rm -rf ~bob/*",
+        ] {
+            assert!(blocked(cmd), "{cmd}");
+        }
+        assert!(destructive("rm -rf /Users/alice/project/*"));
+        assert!(destructive("rm -rf /home/bob/build"));
+    }
+
+    #[test]
+    fn recursive_flag_clusters_are_caught() {
+        for cmd in [
+            "chmod -Rv 777 ~",
+            "sudo chown -Rf nobody /",
+            "chmod -vR 755 /etc",
+            "chmod --recursive 777 /",
+            "chgrp -R staff ~",
+        ] {
+            assert!(blocked(cmd), "{cmd}");
+        }
+        assert!(safe("chmod -v 644 ~/notes.txt"));
+        assert!(safe("chmod -R 755 build"));
+    }
+
+    #[test]
+    fn writes_to_raw_devices_are_blocked() {
+        for cmd in [
+            "cat disk.img > /dev/disk2",
+            "cat disk.img >> /dev/sda",
+            "cat disk.img &> /dev/rdisk3",
+            "cat disk.img | sudo tee /dev/nvme0n1",
+            "dd if=x.img of=/dev/disk4",
+        ] {
+            assert!(blocked(cmd), "{cmd}");
+        }
+        for cmd in [
+            "make > /dev/null 2>&1",
+            "echo hi > /dev/stderr",
+            "echo hi > /dev/stdout",
+            "echo hi > /dev/tty",
+            "echo hi >/dev/fd/3",
+            "dd if=/dev/zero of=/dev/null count=1",
+            "cat x > /dev/shm/x",
+        ] {
+            assert!(safe(cmd), "{cmd}");
+        }
+        assert!(destructive("dd if=a.img of=out.img"));
+        let mut c = cfg();
+        c.block_catastrophic = false;
+        assert!(matches!(
+            classify("cat x > /dev/disk2", &c),
+            Verdict::Destructive(_)
+        ));
+    }
+
+    #[test]
+    fn function_bodies_are_judged() {
+        for cmd in [
+            "function cleanup { rm -rf ~; }; cleanup",
+            "function cleanup() { rm -rf ~; }",
+            "cleanup() { rm -rf ~; }; cleanup",
+            "cleanup () {\n  rm -rf ~\n}",
+        ] {
+            assert!(blocked(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn diskutil_destructive_verbs_are_blocked() {
+        for cmd in [
+            "diskutil secureErase 0 disk2",
+            "diskutil partitionDisk disk2 GPT JHFS+ New 100%",
+            "diskutil reformat disk2",
+            "diskutil eraseDisk APFS X disk2",
+            "diskutil apfs deleteContainer disk3",
+            "diskutil apfs deleteVolume disk3s5",
+            "diskutil zeroDisk disk2",
+        ] {
+            assert!(blocked(cmd), "{cmd}");
+        }
+        assert!(safe("diskutil list"));
+        assert!(safe("diskutil info disk2"));
+    }
+
+    #[test]
+    fn git_checkout_of_paths_is_destructive() {
+        for cmd in [
+            "git checkout src/main.rs",
+            "git checkout HEAD src/main.rs",
+            "git checkout main Cargo.toml",
+            "git checkout HEAD~1 Makefile",
+            "git checkout .gitignore",
+            "git checkout .github/workflows/ci.yml",
+            "git checkout src/",
+            "git checkout ./README",
+            "git checkout '*.rs'",
+            "git checkout --pathspec-from-file=paths.txt",
+        ] {
+            assert!(destructive(cmd), "{cmd}");
+        }
+        for cmd in [
+            "git checkout -b x",
+            "git checkout main",
+            "git checkout feature/foo",
+            "git checkout -b feature origin/feature",
+            "git checkout -t origin/feature",
+            "git checkout --track origin/feature",
+            "git checkout -",
+            "git checkout HEAD~1",
+            "git checkout v1.2.3",
+            "git checkout release/2.x",
+            "git checkout -q --detach main",
+            "git checkout --orphan gh-pages",
+        ] {
+            assert!(safe(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn in_place_flag_clusters_are_caught() {
+        for cmd in [
+            "sed -Ei 's/a/b/' f",
+            "sed -ri 's/a/b/' f",
+            "sed -i.bak 's/a/b/' f",
+            "sed -n -i 's/a/b/p' f",
+            "sed -I '' 's/a/b/' f",
+            "perl -0pi -e 's/a/b/' f",
+            "perl -lpi -e 's/a/b/' f",
+            "perl -0777pi -e 's/a/b/' f",
+            "perl -pi.bak -e 's/a/b/' f",
+            "perl -i -pe 's/a/b/' f",
+            "perl -pie 's/a/b/' f",
+            "perl -0x1Fpi -e 's/a/b/' f",
+        ] {
+            assert!(destructive(cmd), "{cmd}");
+        }
+        for cmd in [
+            "sed -n 's/i/x/p' f",
+            "sed -e 's/i/x/' f",
+            "sed -E 's/a/b/' f",
+            "sed -ne 's/i/x/p' f",
+            "perl -ne 'print if /i/' f",
+            "perl -lane 'print $F[0]' f",
+            "perl -Mstrict -e 'print 1'",
+            "perl -Ilib -e 'print 1'",
+            "perl -le 'print 1'",
+            "perl -0777 -ne 'print' f",
+        ] {
+            assert!(safe(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn tee_and_rsync_overwrites_are_destructive() {
+        for cmd in [
+            "echo x | tee src/lib.rs",
+            "echo x | tee -p out.txt",
+            "echo x | tee -- -a",
+            "rsync -a --delete dist/ src/",
+            "rsync -av --delete-after a/ b/",
+            "rsync -a --del a/ b/",
+            "rsync -a --remove-source-files a/ b/",
+        ] {
+            assert!(destructive(cmd), "{cmd}");
+        }
+        for cmd in [
+            "echo x | tee -a log.txt",
+            "echo x | tee --append log.txt",
+            "echo x | tee /tmp/x",
+            "echo x | tee /dev/null",
+            "echo x | tee",
+            "rsync -a dist/ out/",
+            "cp a b",
+        ] {
+            assert!(safe(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn command_lookup_is_not_a_wrapper() {
+        for cmd in ["command -v rm", "command -V rm", "command -pv rm"] {
+            assert!(safe(cmd), "{cmd}");
+        }
+        assert!(blocked("command rm -rf ~"));
+        assert!(blocked("command -p rm -rf ~"));
     }
 
     #[test]
