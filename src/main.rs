@@ -83,6 +83,10 @@ enum Cmd {
         id: String,
         #[arg(long)]
         yes: bool,
+        /// Restore even where a file became a directory or the reverse,
+        /// deleting what is there now (ignored files included).
+        #[arg(long)]
+        force: bool,
         /// Limit the restore to these paths (relative to the repository root).
         #[arg(last = true)]
         paths: Vec<String>,
@@ -213,7 +217,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Restore { id, yes, paths } => {
+        Cmd::Restore {
+            id,
+            yes,
+            force,
+            paths,
+        } => {
             let store = Store::open_default()?;
             let record = snapshot::find(store.root(), &id)?;
             if !yes {
@@ -230,18 +239,26 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         println!("  {line}");
                     }
                 }
-                let diff = snapshot::preview(store.root(), &record)?;
-                if diff.is_empty() {
+                let preview = snapshot::preview(store.root(), &record)?;
+                if preview.diff.is_empty() {
                     println!("the work tree already contains every file in the snapshot.");
                 } else {
-                    println!("restoring would write:\n{diff}");
+                    println!("restoring would write:\n{}", preview.diff);
+                }
+                if !preview.conflicts.is_empty() {
+                    println!(
+                        "\nrestoring would replace these, deleting everything in them (ignored files included); --yes refuses them unless --force:"
+                    );
+                    for c in &preview.conflicts {
+                        println!("  {c}");
+                    }
                 }
                 println!(
                     "\nRe-run with --yes to write the snapshot's files back. Files created since are kept, and the current state is snapshotted first."
                 );
                 return Ok(ExitCode::SUCCESS);
             }
-            let backup = snapshot::restore(store.root(), &record, &paths)?;
+            let backup = snapshot::restore(store.root(), &record, &paths, force)?;
             println!("restored snapshot {} into {}", record.id, record.repo);
             if let Some(b) = backup {
                 println!(

@@ -386,8 +386,10 @@ fn worktree_tree(data_dir: &Path, root: &Path, tag: &str) -> Result<Tree> {
     })
 }
 
-/// One file in a snapshot, by its path relative to the repository root.
+/// One file in a snapshot: its mode (`100644`, `120000`, `160000`, ...)
+/// and its path relative to the repository root.
 struct Entry {
+    mode: Vec<u8>,
     path: Vec<u8>,
 }
 
@@ -414,10 +416,46 @@ fn snapshot_entries(
         .filter_map(|rec| {
             let tab = rec.iter().position(|b| *b == b'\t')?;
             Some(Entry {
+                mode: rec.split(|b| *b == b' ').next()?.to_vec(),
                 path: rec[tab + 1..].to_vec(),
             })
         })
         .collect())
+}
+
+/// Paths where the snapshot and the work tree disagree on file versus
+/// directory. `git restore --overlay` still replaces those, deleting the
+/// whole directory, ignored files included, so they are refused unless forced.
+fn type_conflicts(repo: &Path, entries: &[Entry]) -> Vec<String> {
+    let mut conflicts = std::collections::BTreeSet::new();
+    let mut parents = std::collections::BTreeSet::new();
+    for entry in entries {
+        let path = entry.path.as_slice();
+        if entry.mode != b"160000"
+            && fs::symlink_metadata(fs_path(repo, path)).is_ok_and(|m| m.is_dir())
+        {
+            conflicts.insert(format!(
+                "{}/ (a directory now, a file in the snapshot)",
+                String::from_utf8_lossy(path)
+            ));
+        }
+        let mut end = path.len();
+        while let Some(slash) = path[..end].iter().rposition(|b| *b == b'/') {
+            if !parents.insert(&path[..slash]) {
+                break;
+            }
+            end = slash;
+        }
+    }
+    for parent in parents {
+        if fs::symlink_metadata(fs_path(repo, parent)).is_ok_and(|m| !m.is_dir()) {
+            conflicts.insert(format!(
+                "{} (a file now, a directory in the snapshot)",
+                String::from_utf8_lossy(parent)
+            ));
+        }
+    }
+    conflicts.into_iter().collect()
 }
 
 /// Skip-worktree files that a whole-tree `git restore` would pass over but
@@ -543,12 +581,20 @@ pub fn find(data_dir: &Path, id: &str) -> Result<SnapshotRecord> {
         .with_context(|| format!("no snapshot with id {id}"))
 }
 
+/// What restoring a snapshot would do.
+pub struct Preview {
+    /// `git diff --stat` of the files restoring would add or change.
+    pub diff: String,
+    /// Paths that are a file on one side and a directory on the other.
+    pub conflicts: Vec<String>,
+}
+
 /// Files restoring would add or change, compared with the whole current work
 /// tree including untracked files. Deletions are omitted: restore keeps them.
-pub fn preview(data_dir: &Path, record: &SnapshotRecord) -> Result<String> {
+pub fn preview(data_dir: &Path, record: &SnapshotRecord) -> Result<Preview> {
     let repo = Path::new(&record.repo);
     let current = worktree_tree(data_dir, repo, "preview")?.id;
-    git(
+    let diff = git(
         repo,
         &[
             "diff",
@@ -559,16 +605,23 @@ pub fn preview(data_dir: &Path, record: &SnapshotRecord) -> Result<String> {
             "--",
         ],
         None,
-    )
+    )?;
+    let entries = snapshot_entries(data_dir, repo, &record.commit, &[])?;
+    Ok(Preview {
+        diff,
+        conflicts: type_conflicts(repo, &entries),
+    })
 }
 
 /// Writes the snapshot's version of `paths` (or everything) back into the
 /// work tree. Files created after the snapshot are kept, and the current
-/// state is snapshotted first so the restore itself can be undone.
+/// state is snapshotted first so the restore itself can be undone. Paths that
+/// changed between file and directory are refused unless `force`.
 pub fn restore(
     data_dir: &Path,
     record: &SnapshotRecord,
     paths: &[String],
+    force: bool,
 ) -> Result<Option<SnapshotRecord>> {
     let repo = Path::new(&record.repo);
     git(
@@ -578,6 +631,13 @@ pub fn restore(
     )
     .context("snapshot commit is missing (was it pruned?)")?;
     let entries = snapshot_entries(data_dir, repo, &record.commit, paths)?;
+    let conflicts = type_conflicts(repo, &entries);
+    if !conflicts.is_empty() && !force {
+        bail!(
+            "restoring would replace these paths and delete everything in them, ignored files included:\n  {}\nMove them aside, restore other paths, or re-run with --force.",
+            conflicts.join("\n  ")
+        );
+    }
     let sparse_work = if paths.is_empty() {
         skip_worktree_to_restore(repo, &record.commit, &entries)?
     } else {
@@ -705,12 +765,14 @@ mod tests {
 
         let found = find(data.path(), &rec.id).unwrap();
         let shown = preview(data.path(), &found).unwrap();
-        assert!(shown.contains("tracked.txt"), "{shown}");
+        assert!(shown.diff.contains("tracked.txt"), "{}", shown.diff);
         assert!(
-            shown.contains("new.txt"),
-            "untracked files must be previewed: {shown}"
+            shown.diff.contains("new.txt"),
+            "untracked files must be previewed: {}",
+            shown.diff
         );
-        let backup = restore(data.path(), &found, &[]).unwrap();
+        assert!(shown.conflicts.is_empty());
+        let backup = restore(data.path(), &found, &[], false).unwrap();
         assert!(backup.is_some());
         assert_eq!(
             fs::read_to_string(r.join("tracked.txt")).unwrap(),
@@ -742,7 +804,7 @@ mod tests {
             .unwrap()
             .unwrap();
         fs::remove_file(repo.path().join("a.txt")).unwrap();
-        restore(data.path(), &rec, &["a.txt".into()]).unwrap();
+        restore(data.path(), &rec, &["a.txt".into()], false).unwrap();
         assert_eq!(fs::read_to_string(repo.path().join("a.txt")).unwrap(), "a");
 
         let plain = tempfile::tempdir().unwrap();
@@ -766,7 +828,7 @@ mod tests {
             .unwrap();
         assert!(rec.repo.ends_with("sp "), "{:?}", rec.repo);
         fs::remove_file(r.join("a.txt")).unwrap();
-        restore(data.path(), &rec, &[]).unwrap();
+        restore(data.path(), &rec, &[], false).unwrap();
         assert_eq!(fs::read_to_string(r.join("a.txt")).unwrap(), "a");
     }
 
@@ -816,7 +878,7 @@ mod tests {
 
         fs::remove_file(r.join("cfg.txt")).unwrap();
         fs::remove_file(r.join("b.txt")).unwrap();
-        restore(data.path(), &rec, &[]).unwrap();
+        restore(data.path(), &rec, &[], false).unwrap();
         assert_eq!(fs::read_to_string(r.join("cfg.txt")).unwrap(), "local cfg");
         assert_eq!(fs::read_to_string(r.join("b.txt")).unwrap(), "local b");
         assert!(
@@ -826,7 +888,7 @@ mod tests {
 
         // Naming a skip-worktree path restores it as well.
         fs::remove_file(r.join("cfg.txt")).unwrap();
-        restore(data.path(), &rec, &["cfg.txt".into()]).unwrap();
+        restore(data.path(), &rec, &["cfg.txt".into()], false).unwrap();
         assert_eq!(fs::read_to_string(r.join("cfg.txt")).unwrap(), "local cfg");
     }
 
@@ -876,11 +938,64 @@ mod tests {
         );
 
         fs::remove_dir_all(r.join("vendor")).unwrap();
-        restore(data.path(), &rec, &[]).unwrap();
+        restore(data.path(), &rec, &[], false).unwrap();
         assert_eq!(fs::read_to_string(empty.join("x.txt")).unwrap(), "x");
         assert_eq!(fs::read_to_string(dep.join("y.txt")).unwrap(), "y edited");
         assert_eq!(fs::read_to_string(inner.join("w.txt")).unwrap(), "w");
         assert_eq!(fs::read_to_string(r.join("a.txt")).unwrap(), "a");
+    }
+
+    #[test]
+    fn restore_refuses_to_replace_a_directory_or_file_of_the_other_type() {
+        let repo = committed_repo(&[("foo", "file"), ("d/a.txt", "a"), (".gitignore", "*.log\n")]);
+        let data = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        fs::write(r.join("keep.txt"), "k").unwrap();
+        let rec = take(data.path(), r, "s", "t", "rm foo").unwrap().unwrap();
+
+        // foo becomes a directory holding an ignored file; d becomes a file.
+        fs::remove_file(r.join("foo")).unwrap();
+        fs::create_dir(r.join("foo")).unwrap();
+        fs::write(r.join("foo/new.txt"), "new").unwrap();
+        fs::write(r.join("foo/x.log"), "ignored but precious").unwrap();
+        fs::remove_dir_all(r.join("d")).unwrap();
+        fs::write(r.join("d"), "now a file").unwrap();
+        fs::remove_file(r.join("keep.txt")).unwrap();
+
+        let shown = preview(data.path(), &rec).unwrap();
+        assert_eq!(shown.conflicts.len(), 2, "{:?}", shown.conflicts);
+        assert!(
+            shown.conflicts[0].starts_with("d "),
+            "{:?}",
+            shown.conflicts
+        );
+        assert!(
+            shown.conflicts[1].starts_with("foo/ "),
+            "{:?}",
+            shown.conflicts
+        );
+
+        let before = list(data.path()).unwrap().len();
+        let err = restore(data.path(), &rec, &[], false).unwrap_err();
+        assert!(format!("{err:#}").contains("foo/"), "{err:#}");
+        assert_eq!(
+            list(data.path()).unwrap().len(),
+            before,
+            "no backup on refusal"
+        );
+        assert!(!r.join("keep.txt").exists(), "nothing written on refusal");
+        assert_eq!(
+            fs::read_to_string(r.join("foo/x.log")).unwrap(),
+            "ignored but precious"
+        );
+
+        // Paths away from the conflicts restore normally.
+        restore(data.path(), &rec, &["keep.txt".into()], false).unwrap();
+        assert_eq!(fs::read_to_string(r.join("keep.txt")).unwrap(), "k");
+
+        restore(data.path(), &rec, &[], true).unwrap();
+        assert_eq!(fs::read_to_string(r.join("foo")).unwrap(), "file");
+        assert_eq!(fs::read_to_string(r.join("d/a.txt")).unwrap(), "a");
     }
 
     #[test]
