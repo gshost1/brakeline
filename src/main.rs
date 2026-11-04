@@ -224,6 +224,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     ago(record.created_at)
                 );
                 println!("taken before: {}", record.command);
+                if !record.uncovered.is_empty() {
+                    println!("not in this snapshot:");
+                    for line in &record.uncovered {
+                        println!("  {line}");
+                    }
+                }
                 let diff = snapshot::preview(store.root(), &record)?;
                 if diff.is_empty() {
                     println!("the work tree already contains every file in the snapshot.");

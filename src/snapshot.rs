@@ -4,6 +4,7 @@
 //! throwaway index, so the user's index, working tree, branches, and stash are
 //! never touched. Each snapshot is pinned by `refs/brakeline/snapshots/<id>`.
 
+use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,9 @@ pub struct SnapshotRecord {
     pub reason: String,
     pub command: String,
     pub created_at: u64,
+    /// Paths the snapshot could not include, each with the reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncovered: Vec<String>,
 }
 
 /// Runs git in `repo` and returns its raw stdout. `env` adds variables (such
@@ -34,7 +38,7 @@ fn git_raw(
     repo: &Path,
     args: &[&str],
     index: Option<&Path>,
-    env: &[(&str, &Path)],
+    env: &[(&str, &OsStr)],
     input: Option<Vec<u8>>,
 ) -> Result<Vec<u8>> {
     let mut cmd = Command::new("git");
@@ -87,12 +91,15 @@ fn git_raw(
 /// Runs git and returns stdout minus its final newline. Only the newline is
 /// removed: a path such as the repository root may itself end in whitespace.
 fn git(repo: &Path, args: &[&str], index: Option<&Path>) -> Result<String> {
-    let out = git_raw(repo, args, index, &[], None)?;
+    Ok(text(git_raw(repo, args, index, &[], None)?))
+}
+
+fn text(out: Vec<u8>) -> String {
     let mut text = String::from_utf8_lossy(&out).into_owned();
     if text.ends_with('\n') {
         text.pop();
     }
-    Ok(text)
+    text
 }
 
 pub fn repo_root(cwd: &Path) -> Option<PathBuf> {
@@ -228,9 +235,133 @@ fn clear_index_flags(root: &Path, index: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How deep untracked repositories inside untracked repositories are followed.
+const MAX_NESTED_DEPTH: usize = 8;
+
+/// A work tree written as a git tree object.
+struct Tree {
+    id: String,
+    /// Paths left out, each with the reason.
+    uncovered: Vec<String>,
+}
+
+/// Collects a work tree into a temporary index, storing the files of
+/// untracked nested repositories as ordinary files. `git add -A` alone would
+/// fail on a nested repository with no commits and store only a commit link
+/// (not the files) for one with commits. Registered submodules are tracked
+/// in the index and stay commit links.
+struct Walker<'a> {
+    data_dir: &'a Path,
+    /// The outer repository's git directory, which receives all objects.
+    git_dir: PathBuf,
+    uncovered: Vec<String>,
+}
+
+impl Walker<'_> {
+    /// `git add -A` of everything under `dir` into `index`, except untracked
+    /// nested repositories, which are walked separately and grafted in.
+    /// `nested` is false for the outer repository itself.
+    fn add_all(
+        &mut self,
+        dir: &Path,
+        index: &Path,
+        nested: bool,
+        shown: &str,
+        depth: usize,
+    ) -> Result<()> {
+        let git_dir = self.git_dir.clone();
+        let fsmonitor_off = [
+            ("GIT_DIR", git_dir.as_os_str()),
+            ("GIT_WORK_TREE", dir.as_os_str()),
+            // The outer repo's file-system monitor watches a different tree.
+            ("GIT_CONFIG_COUNT", OsStr::new("1")),
+            ("GIT_CONFIG_KEY_0", OsStr::new("core.fsmonitor")),
+            ("GIT_CONFIG_VALUE_0", OsStr::new("false")),
+        ];
+        let env: &[(&str, &OsStr)] = if nested { &fsmonitor_off } else { &[] };
+        let out = git_raw(
+            dir,
+            &["ls-files", "-o", "--exclude-standard", "-z"],
+            Some(index),
+            env,
+            None,
+        )?;
+        // Untracked directories are listed file by file; a trailing slash
+        // marks a directory git will not enter: a nested repository.
+        let repos: Vec<&[u8]> = split_z(&out).filter_map(|r| r.strip_suffix(b"/")).collect();
+        let mut spec = b".\0".to_vec();
+        for repo in &repos {
+            spec.extend_from_slice(b":(exclude,literal)");
+            spec.extend_from_slice(repo);
+            spec.push(0);
+        }
+        git_raw(
+            dir,
+            &["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
+            Some(index),
+            env,
+            Some(spec),
+        )?;
+        for repo in repos {
+            let name = format!("{shown}{}", String::from_utf8_lossy(repo));
+            if let Err(err) = self.graft(dir, index, env, repo, &name, depth) {
+                self.uncovered.push(format!("{name}/: {err:#}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the nested repository at `dir/repo` as a tree and reads it
+    /// into `index` under that path.
+    fn graft(
+        &mut self,
+        dir: &Path,
+        index: &Path,
+        env: &[(&str, &OsStr)],
+        repo: &[u8],
+        name: &str,
+        depth: usize,
+    ) -> Result<()> {
+        if depth >= MAX_NESTED_DEPTH {
+            bail!("nested git repositories go too deep");
+        }
+        let Ok(rel) = std::str::from_utf8(repo) else {
+            bail!("path is not valid UTF-8");
+        };
+        let nested_dir = fs_path(dir, repo);
+        let nested_index = temp_index(self.data_dir, "nested")?;
+        self.add_all(
+            &nested_dir,
+            &nested_index.0,
+            true,
+            &format!("{name}/"),
+            depth + 1,
+        )?;
+        let nested_env = [
+            ("GIT_DIR", self.git_dir.as_os_str()),
+            ("GIT_WORK_TREE", nested_dir.as_os_str()),
+        ];
+        let tree = text(git_raw(
+            &nested_dir,
+            &["write-tree"],
+            Some(&nested_index.0),
+            &nested_env,
+            None,
+        )?);
+        git_raw(
+            dir,
+            &["read-tree", &format!("--prefix={rel}/"), &tree],
+            Some(index),
+            env,
+            None,
+        )?;
+        Ok(())
+    }
+}
+
 /// Writes the current work tree (tracked and untracked, minus ignored files)
-/// as a git tree object, using a throwaway index. Returns the tree id.
-fn worktree_tree(data_dir: &Path, root: &Path, tag: &str) -> Result<String> {
+/// as a git tree object, using a throwaway index.
+fn worktree_tree(data_dir: &Path, root: &Path, tag: &str) -> Result<Tree> {
     let index = temp_index(data_dir, tag)?;
 
     // Seed the temp index from the real one so unchanged files are not rehashed.
@@ -243,8 +374,16 @@ fn worktree_tree(data_dir: &Path, root: &Path, tag: &str) -> Result<String> {
         fs::copy(&real_index, &index.0).context("cannot copy git index")?;
         clear_index_flags(root, &index.0)?;
     }
-    git(root, &["add", "-A", "--", "."], Some(&index.0))?;
-    git(root, &["write-tree"], Some(&index.0))
+    let mut walker = Walker {
+        data_dir,
+        git_dir: PathBuf::from(git(root, &["rev-parse", "--absolute-git-dir"], None)?),
+        uncovered: Vec::new(),
+    };
+    walker.add_all(root, &index.0, false, "", 0)?;
+    Ok(Tree {
+        id: git(root, &["write-tree"], Some(&index.0))?,
+        uncovered: walker.uncovered,
+    })
 }
 
 /// One file in a snapshot, by its path relative to the repository root.
@@ -322,7 +461,10 @@ pub fn take(
     };
     let id = new_id();
     let head = git(&root, &["rev-parse", "--verify", "-q", "HEAD"], None).ok();
-    let tree = worktree_tree(data_dir, &root, &id)?;
+    let Tree {
+        id: tree,
+        uncovered,
+    } = worktree_tree(data_dir, &root, &id)?;
 
     let unchanged = match &head {
         Some(h) => {
@@ -359,6 +501,7 @@ pub fn take(
         reason: reason.to_string(),
         command: truncate(command, 300),
         created_at: now_secs(),
+        uncovered,
     };
     append_record(data_dir, &record)?;
     Ok(Some(record))
@@ -404,7 +547,7 @@ pub fn find(data_dir: &Path, id: &str) -> Result<SnapshotRecord> {
 /// tree including untracked files. Deletions are omitted: restore keeps them.
 pub fn preview(data_dir: &Path, record: &SnapshotRecord) -> Result<String> {
     let repo = Path::new(&record.repo);
-    let current = worktree_tree(data_dir, repo, "preview")?;
+    let current = worktree_tree(data_dir, repo, "preview")?.id;
     git(
         repo,
         &[
@@ -470,7 +613,7 @@ pub fn restore(
                 "--pathspec-file-nul",
             ],
             None,
-            &[("GIT_LITERAL_PATHSPECS", Path::new("1"))],
+            &[("GIT_LITERAL_PATHSPECS", OsStr::new("1"))],
             Some(join_z(sparse_work.iter().map(Vec::as_slice))),
         )?;
     }
@@ -685,6 +828,59 @@ mod tests {
         fs::remove_file(r.join("cfg.txt")).unwrap();
         restore(data.path(), &rec, &["cfg.txt".into()]).unwrap();
         assert_eq!(fs::read_to_string(r.join("cfg.txt")).unwrap(), "local cfg");
+    }
+
+    #[test]
+    fn untracked_nested_repositories_are_snapshotted_as_plain_files() {
+        let repo = committed_repo(&[("a.txt", "a")]);
+        let data = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        // A nested repo with no commits (git add -A fails on it)...
+        let empty = r.join("vendor/lib");
+        fs::create_dir_all(&empty).unwrap();
+        sh(&empty, &["init", "-q"]);
+        fs::write(empty.join("x.txt"), "x").unwrap();
+        // ...and one with commits (git add -A stores only a gitlink), with its
+        // own ignore rules and a repo nested inside it.
+        let dep = r.join("vendor/dep");
+        fs::create_dir_all(&dep).unwrap();
+        sh(&dep, &["init", "-q"]);
+        fs::write(dep.join("y.txt"), "y").unwrap();
+        fs::write(dep.join(".gitignore"), "*.log\n").unwrap();
+        sh(&dep, &["add", "-A"]);
+        sh(&dep, &["commit", "-q", "-m", "dep"]);
+        fs::write(dep.join("y.txt"), "y edited").unwrap();
+        fs::write(dep.join("debug.log"), "noise").unwrap();
+        let inner = dep.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        sh(&inner, &["init", "-q"]);
+        fs::write(inner.join("w.txt"), "w").unwrap();
+
+        let rec = take(data.path(), r, "s", "t", "rm -rf vendor")
+            .unwrap()
+            .unwrap();
+        assert!(rec.uncovered.is_empty(), "{:?}", rec.uncovered);
+        let mode = |p: &str| {
+            git(r, &["ls-tree", &rec.commit, "--", p], None)
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(mode("vendor/dep/y.txt"), "100644");
+        assert_eq!(
+            mode("vendor/dep/debug.log"),
+            "",
+            "nested ignore rules apply"
+        );
+
+        fs::remove_dir_all(r.join("vendor")).unwrap();
+        restore(data.path(), &rec, &[]).unwrap();
+        assert_eq!(fs::read_to_string(empty.join("x.txt")).unwrap(), "x");
+        assert_eq!(fs::read_to_string(dep.join("y.txt")).unwrap(), "y edited");
+        assert_eq!(fs::read_to_string(inner.join("w.txt")).unwrap(), "w");
+        assert_eq!(fs::read_to_string(r.join("a.txt")).unwrap(), "a");
     }
 
     #[test]
