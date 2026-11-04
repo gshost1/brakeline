@@ -328,26 +328,45 @@ fn read_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
     }
 }
 
-pub fn load_user() -> Result<Config> {
-    let Some(path) = user_config_path() else {
+fn load_user_from(path: Option<&Path>) -> Result<Config> {
+    let Some(path) = path else {
         return Ok(Config::default());
     };
-    let mut cfg: Config = read_toml(&path)?.unwrap_or_default();
+    let mut cfg: Config = read_toml(path)?.unwrap_or_default();
     cfg.validate()
         .with_context(|| format!("invalid config {}", path.display()))?;
     cfg.normalize();
     Ok(cfg)
 }
 
-/// Loads the user config (or defaults) and tightens it with the project config.
-pub fn load(cwd: Option<&Path>) -> Result<Config> {
-    let mut cfg = load_user()?;
-    if let Some(cwd) = cwd
-        && let Some(project) = read_toml::<ProjectConfig>(&project_config_path(cwd))?
-    {
-        cfg.tighten_with(&project);
+/// Loads the user config (or defaults) and tightens it with the project
+/// config. Never fails: problems come back as notices for the user.
+///
+/// A broken user config falls back to the defaults. A broken or unreadable
+/// project config is ignored and the user config is kept, so a repository
+/// can never loosen limits by shipping an invalid `.brakeline.toml`.
+pub fn load(cwd: Option<&Path>) -> (Config, Vec<String>) {
+    load_from(user_config_path().as_deref(), cwd)
+}
+
+fn load_from(user: Option<&Path>, cwd: Option<&Path>) -> (Config, Vec<String>) {
+    let mut notices = Vec::new();
+    let mut cfg = load_user_from(user).unwrap_or_else(|err| {
+        notices.push(format!(
+            "brakeline user config error, using defaults: {err:#}"
+        ));
+        Config::default()
+    });
+    if let Some(cwd) = cwd {
+        match read_toml::<ProjectConfig>(&project_config_path(cwd)) {
+            Ok(Some(project)) => cfg.tighten_with(&project),
+            Ok(None) => {}
+            Err(err) => notices.push(format!(
+                "brakeline ignored the project config and kept your own limits: {err:#}"
+            )),
+        }
     }
-    Ok(cfg)
+    (cfg, notices)
 }
 
 #[cfg(test)]
@@ -446,6 +465,69 @@ mod tests {
         let text = include_str!("../examples/config.toml");
         let cfg: Config = toml::from_str(text).unwrap();
         assert_eq!(cfg, Config::default());
+    }
+
+    fn user_file(dir: &Path) -> PathBuf {
+        let path = dir.join("user.toml");
+        std::fs::write(
+            &path,
+            "[budget]\nmax_cost_usd = 5.0\nmax_tool_calls = 20\n\
+             [shell]\nblocked_substrings = [\"terraform destroy\"]\n",
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn broken_project_config_keeps_the_user_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = user_file(dir.path());
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+
+        std::fs::write(repo.join(".brakeline.toml"), "bogus_key = 1\n").unwrap();
+        let (cfg, notices) = load_from(Some(&user), Some(&repo));
+        assert_eq!(cfg.budget.max_cost_usd, Some(5.0));
+        assert_eq!(cfg.budget.max_tool_calls, Some(20));
+        assert_eq!(cfg.shell.blocked_substrings, vec!["terraform destroy"]);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains(".brakeline.toml"), "{notices:?}");
+
+        // Unreadable (a directory) behaves the same way.
+        std::fs::remove_file(repo.join(".brakeline.toml")).unwrap();
+        std::fs::create_dir(repo.join(".brakeline.toml")).unwrap();
+        let (cfg, notices) = load_from(Some(&user), Some(&repo));
+        assert_eq!(cfg.budget.max_cost_usd, Some(5.0));
+        assert_eq!(cfg.shell.blocked_substrings, vec!["terraform destroy"]);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+    }
+
+    #[test]
+    fn broken_user_config_falls_back_to_defaults_still_tightened_by_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        std::fs::write(&user, "not toml [").unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(
+            repo.join(".brakeline.toml"),
+            "[budget]\nmax_cost_usd = 2.0\n[shell]\nblocked_substrings = [\"drop table\"]\n",
+        )
+        .unwrap();
+        let (cfg, notices) = load_from(Some(&user), Some(&repo));
+        assert_eq!(cfg.budget.max_cost_usd, Some(2.0));
+        assert_eq!(cfg.shell.blocked_substrings, vec!["drop table"]);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+
+        // A valid project config on top of a valid user config: no notices.
+        let user = user_file(dir.path());
+        let (cfg, notices) = load_from(Some(&user), Some(&repo));
+        assert_eq!(cfg.budget.max_cost_usd, Some(2.0));
+        assert_eq!(
+            cfg.shell.blocked_substrings,
+            vec!["terraform destroy", "drop table"]
+        );
+        assert!(notices.is_empty(), "{notices:?}");
     }
 
     #[test]

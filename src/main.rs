@@ -127,11 +127,21 @@ fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Loads the effective config for a CLI command, warning on stderr about any
+/// config file that could not be used.
+fn load_config(cwd: Option<&Path>) -> config::Config {
+    let (cfg, notices) = config::load(cwd);
+    for notice in notices {
+        eprintln!("warning: {notice}");
+    }
+    cfg
+}
+
 fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Cmd::Hook { format, agent } => run_hook(format, matches!(agent, Agent::Droid)),
         Cmd::Check { command } => {
-            let cfg = config::load(Some(&cwd()))?;
+            let cfg = load_config(Some(&cwd()));
             let line = command.join(" ");
             let verdict = shell::classify(&line, &cfg.shell);
             match &verdict {
@@ -249,7 +259,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Config => {
-            let cfg = config::load(Some(&cwd()))?;
+            let cfg = load_config(Some(&cwd()));
             if let Some(p) = config::user_config_path() {
                 println!("# user config: {}", p.display());
             }
@@ -298,13 +308,8 @@ fn run_hook(format: HookFormat, infer_failures: bool) -> Result<ExitCode> {
     let input: HookInput = serde_json::from_str(&raw).context("hook input is not valid JSON")?;
     let cwd = input.cwd.as_deref().map(Path::new);
 
-    let (cfg, notice) = match config::load(cwd) {
-        Ok(cfg) => (cfg, None),
-        Err(err) => (
-            config::Config::default(),
-            Some(format!("brakeline config error, using defaults: {err:#}")),
-        ),
-    };
+    let (cfg, notices) = config::load(cwd);
+    let notice = (!notices.is_empty()).then(|| notices.join("\n"));
     let format = match format {
         HookFormat::Json => Format::Json,
         HookFormat::ExitCode => Format::ExitCode,
