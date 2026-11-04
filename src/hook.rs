@@ -181,9 +181,12 @@ impl Engine<'_> {
                 // A metering failure must not block work; budgets just lag.
                 let path = Path::new(path);
                 if let Some(settings) = meter::droid_settings_path(path) {
-                    if let Ok(raw) = meter::read_droid_totals(&settings, cfg) {
-                        s.usage = meter::since(&raw, &s.usage_baseline);
-                        s.usage_raw = raw;
+                    if let Ok(totals) = meter::read_droid_totals(&settings) {
+                        meter::accumulate_droid(&mut s.usage_raw, &totals, cfg);
+                        let now = meter::since(&s.usage_raw, &s.usage_baseline);
+                        // Budgets only see use go up, even if Droid's
+                        // counters restart.
+                        s.usage = meter::at_least(&now, &s.usage);
                     }
                 } else {
                     let _ = meter::update(path, &mut s.transcript, &mut s.usage, cfg);
@@ -737,6 +740,108 @@ mod tests {
         let s = h.store.load("sess").unwrap().unwrap();
         assert!(s.failures.iter().all(|f| f.total == 0), "{:?}", s.failures);
         assert!(s.pending.is_empty());
+    }
+
+    #[test]
+    fn droid_spend_does_not_drop_when_the_model_changes() {
+        let mut h = Harness::droid();
+        h.cfg.budget.max_cost_usd = Some(50.0);
+        let transcript = h._dir.path().join("abc.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let settings = h._dir.path().join("abc.settings.json");
+        let set = |model: &str, input: u64, output: u64| {
+            let body = json!({"model": model,
+                "inclusiveTokenUsage": {"inputTokens": input, "outputTokens": output}});
+            std::fs::write(&settings, body.to_string()).unwrap();
+        };
+        let engine = Engine {
+            cfg: &h.cfg,
+            store: &h.store,
+            notice: None,
+            infer_failures: true,
+        };
+        let call = |n: u32| {
+            engine.handle(&HookInput {
+                session_id: "sess".into(),
+                transcript_path: Some(transcript.to_string_lossy().into_owned()),
+                cwd: None,
+                hook_event_name: "PreToolUse".into(),
+                tool_name: Some("Read".into()),
+                tool_input: Some(json!({"file_path": format!("/f{n}")})),
+                tool_response: None,
+            })
+        };
+        // Opus: $5 + $42.50.
+        set("claude-opus-5", 1_000_000, 1_700_000);
+        match call(0) {
+            Outcome::Allow(Some(m)) => assert!(m.contains("$47.50"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        // One more million output tokens on Haiku adds $5, not a re-pricing
+        // of the whole session at Haiku rates.
+        set("claude-haiku-5", 1_000_000, 2_700_000);
+        match call(1) {
+            Outcome::Stop(r) => assert!(r.contains("$52.50"), "{r}"),
+            other => panic!("expected budget stop, got {other:?}"),
+        }
+        let s = h.store.load("sess").unwrap().unwrap();
+        assert!(
+            (s.usage.cost_usd - 52.5).abs() < 1e-9,
+            "{}",
+            s.usage.cost_usd
+        );
+    }
+
+    #[test]
+    fn droid_spend_after_budget_reset_counts_only_new_use() {
+        let mut h = Harness::droid();
+        h.cfg.budget.max_cost_usd = Some(50.0);
+        let transcript = h._dir.path().join("abc.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let settings = h._dir.path().join("abc.settings.json");
+        let set = |model: &str, output: u64| {
+            let body = json!({"model": model, "inclusiveTokenUsage": {"outputTokens": output}});
+            std::fs::write(&settings, body.to_string()).unwrap();
+        };
+        let call = |n: u32| {
+            Engine {
+                cfg: &h.cfg,
+                store: &h.store,
+                notice: None,
+                infer_failures: true,
+            }
+            .handle(&HookInput {
+                session_id: "sess".into(),
+                transcript_path: Some(transcript.to_string_lossy().into_owned()),
+                cwd: None,
+                hook_event_name: "PreToolUse".into(),
+                tool_name: Some("Read".into()),
+                tool_input: Some(json!({"file_path": format!("/f{n}")})),
+                tool_response: None,
+            })
+        };
+        set("claude-opus-5", 2_000_000);
+        assert!(matches!(call(0), Outcome::Stop(_)));
+        // What `brakeline reset --budget` does.
+        h.store
+            .with_session("sess", |s| {
+                s.halted = None;
+                s.usage = Default::default();
+                s.usage_baseline = s.usage_raw.clone();
+                s.warned.clear();
+                Ok(())
+            })
+            .unwrap();
+        // Switching to Haiku and adding 1M output costs $5 since the reset.
+        set("claude-haiku-5", 3_000_000);
+        assert!(is_allow(&call(1)));
+        let s = h.store.load("sess").unwrap().unwrap();
+        assert!(
+            (s.usage.cost_usd - 5.0).abs() < 1e-9,
+            "{}",
+            s.usage.cost_usd
+        );
+        assert_eq!(s.usage.output_tokens, 1_000_000);
     }
 
     #[test]

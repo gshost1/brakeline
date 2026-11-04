@@ -209,8 +209,9 @@ pub struct SessionState {
     pub transcript: TranscriptCursor,
     pub snapshots: u64,
     pub pending: Vec<Pending>,
-    /// Cumulative totals last reported by an agent that keeps its own
-    /// counters (Droid), and the totals at the last budget reset.
+    /// Token counters last reported by an agent that keeps its own (Droid),
+    /// with `cost_usd` as a running sum of each increase priced at the model
+    /// in use when it was seen; and this record as of the last budget reset.
     pub usage_raw: Usage,
     pub usage_baseline: Usage,
 }

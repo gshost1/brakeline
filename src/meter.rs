@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::config::{Config, ModelPrice};
 use crate::state::{TranscriptCursor, Usage};
 
 const MAX_SEEN_IDS: usize = 4096;
@@ -69,9 +69,18 @@ pub fn droid_settings_path(transcript: &Path) -> Option<std::path::PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-/// Reads Droid's cumulative totals. Returns them as raw usage, with the cost
-/// estimated from the session's current model.
-pub fn read_droid_totals(settings: &Path, cfg: &Config) -> Result<Usage> {
+/// Droid's cumulative token counters and the model the session uses now.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DroidTotals {
+    /// Token counters and credits; `cost_usd` is always zero here.
+    pub usage: Usage,
+    pub model: String,
+}
+
+/// Reads Droid's cumulative totals. They carry no cost: the file only names
+/// the current model, so pricing all of it at that model would re-price past
+/// use whenever the user switches models. See `accumulate_droid`.
+pub fn read_droid_totals(settings: &Path) -> Result<DroidTotals> {
     let text = std::fs::read_to_string(settings)
         .with_context(|| format!("cannot read {}", settings.display()))?;
     let v: Value = serde_json::from_str(&text)
@@ -82,24 +91,55 @@ pub fn read_droid_totals(settings: &Path, cfg: &Config) -> Result<Usage> {
         .cloned()
         .unwrap_or(Value::Null);
     let n = |k: &str| totals.get(k).and_then(Value::as_u64).unwrap_or(0);
-    let mut usage = Usage {
-        input_tokens: n("inputTokens"),
-        // Thinking tokens are billed as output.
-        output_tokens: n("outputTokens") + n("thinkingTokens"),
-        cache_write_tokens: n("cacheCreationTokens"),
-        cache_read_tokens: n("cacheReadTokens"),
-        factory_credits: n("factoryCredits"),
-        ..Usage::default()
-    };
-    let model = v.get("model").and_then(Value::as_str).unwrap_or("");
-    if let Some(p) = cfg.price_for(model) {
-        usage.cost_usd = (usage.input_tokens as f64 * p.input
-            + usage.output_tokens as f64 * p.output
-            + usage.cache_write_tokens as f64 * p.cache_write
-            + usage.cache_read_tokens as f64 * p.cache_read)
-            / 1_000_000.0;
+    Ok(DroidTotals {
+        usage: Usage {
+            input_tokens: n("inputTokens"),
+            // Thinking tokens are billed as output.
+            output_tokens: n("outputTokens") + n("thinkingTokens"),
+            cache_write_tokens: n("cacheCreationTokens"),
+            cache_read_tokens: n("cacheReadTokens"),
+            factory_credits: n("factoryCredits"),
+            ..Usage::default()
+        },
+        model: v
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+/// Folds newly reported Droid totals into `raw`, the session's running
+/// record. Token growth since the last report is priced at the model in use
+/// now and added to `raw.cost_usd`, so the cost only ever goes up and past
+/// use keeps the price it was billed at.
+pub fn accumulate_droid(raw: &mut Usage, totals: &DroidTotals, cfg: &Config) {
+    let t = &totals.usage;
+    let growth = [
+        t.input_tokens.saturating_sub(raw.input_tokens),
+        t.output_tokens.saturating_sub(raw.output_tokens),
+        t.cache_write_tokens.saturating_sub(raw.cache_write_tokens),
+        t.cache_read_tokens.saturating_sub(raw.cache_read_tokens),
+    ];
+    if let Some(p) = cfg.price_for(&totals.model) {
+        raw.cost_usd += cost(&growth, p);
     }
-    Ok(usage)
+    // Track the reported counters as-is, so if they ever restart lower, later
+    // growth is priced from there rather than ignored.
+    raw.input_tokens = t.input_tokens;
+    raw.output_tokens = t.output_tokens;
+    raw.cache_write_tokens = t.cache_write_tokens;
+    raw.cache_read_tokens = t.cache_read_tokens;
+    raw.factory_credits = t.factory_credits;
+}
+
+/// Dollar cost of [input, output, cache write, cache read] tokens.
+fn cost(tokens: &[u64; 4], p: &ModelPrice) -> f64 {
+    (tokens[0] as f64 * p.input
+        + tokens[1] as f64 * p.output
+        + tokens[2] as f64 * p.cache_write
+        + tokens[3] as f64 * p.cache_read)
+        / 1_000_000.0
 }
 
 /// `raw - baseline`, field by field, never below zero.
@@ -116,6 +156,19 @@ pub fn since(raw: &Usage, baseline: &Usage) -> Usage {
         cost_usd: (raw.cost_usd - baseline.cost_usd).max(0.0),
         messages: raw.messages.saturating_sub(baseline.messages),
         factory_credits: raw.factory_credits.saturating_sub(baseline.factory_credits),
+    }
+}
+
+/// The larger of `a` and `b`, field by field.
+pub fn at_least(a: &Usage, b: &Usage) -> Usage {
+    Usage {
+        input_tokens: a.input_tokens.max(b.input_tokens),
+        output_tokens: a.output_tokens.max(b.output_tokens),
+        cache_write_tokens: a.cache_write_tokens.max(b.cache_write_tokens),
+        cache_read_tokens: a.cache_read_tokens.max(b.cache_read_tokens),
+        cost_usd: a.cost_usd.max(b.cost_usd),
+        messages: a.messages.max(b.messages),
+        factory_credits: a.factory_credits.max(b.factory_credits),
     }
 }
 
@@ -187,11 +240,7 @@ fn account_line(line: &[u8], cursor: &mut TranscriptCursor, usage: &mut Usage, c
     usage.cache_read_tokens += delta[3];
     let model = message.get("model").and_then(Value::as_str).unwrap_or("");
     if let Some(p) = cfg.price_for(model) {
-        usage.cost_usd += (delta[0] as f64 * p.input
-            + delta[1] as f64 * p.output
-            + delta[2] as f64 * p.cache_write
-            + delta[3] as f64 * p.cache_read)
-            / 1_000_000.0;
+        usage.cost_usd += cost(&delta, p);
     }
 }
 
@@ -288,7 +337,10 @@ mod tests {
         )
         .unwrap();
         let settings = droid_settings_path(&transcript).unwrap();
-        let u = read_droid_totals(&settings, &Config::default()).unwrap();
+        let totals = read_droid_totals(&settings).unwrap();
+        assert_eq!(totals.model, "claude-opus-5");
+        let mut u = Usage::default();
+        accumulate_droid(&mut u, &totals, &Config::default());
         assert_eq!(u.output_tokens, 1_000_000);
         assert_eq!(u.factory_credits, 4242);
         assert!((u.cost_usd - 30.0).abs() < 1e-9, "{}", u.cost_usd);
@@ -297,6 +349,31 @@ mod tests {
             ..u.clone()
         };
         assert_eq!(since(&later, &u).factory_credits, 758);
+    }
+
+    #[test]
+    fn droid_growth_is_priced_at_the_model_current_at_the_time() {
+        let cfg = Config::default();
+        let totals = |model: &str, output: u64| DroidTotals {
+            usage: Usage {
+                output_tokens: output,
+                ..Usage::default()
+            },
+            model: model.to_string(),
+        };
+        let mut raw = Usage::default();
+        accumulate_droid(&mut raw, &totals("claude-opus-5", 1_000_000), &cfg);
+        assert!((raw.cost_usd - 25.0).abs() < 1e-9, "{}", raw.cost_usd);
+        // Same totals reported again: nothing new.
+        accumulate_droid(&mut raw, &totals("claude-haiku-5", 1_000_000), &cfg);
+        assert!((raw.cost_usd - 25.0).abs() < 1e-9, "{}", raw.cost_usd);
+        accumulate_droid(&mut raw, &totals("claude-haiku-5", 2_000_000), &cfg);
+        assert!((raw.cost_usd - 30.0).abs() < 1e-9, "{}", raw.cost_usd);
+        // Counters that restart lower never reduce the cost; growth from the
+        // new base is still counted.
+        accumulate_droid(&mut raw, &totals("claude-opus-5", 0), &cfg);
+        accumulate_droid(&mut raw, &totals("claude-opus-5", 1_000_000), &cfg);
+        assert!((raw.cost_usd - 55.0).abs() < 1e-9, "{}", raw.cost_usd);
     }
 
     #[test]
