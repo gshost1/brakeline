@@ -746,7 +746,7 @@ impl Walker<'_> {
         // Records of four fields (source, line, pattern, path), one per path;
         // empty fields when nothing matched.
         let fields: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
-        let records: Vec<&[&[u8]]> = fields.chunks_exact(4).collect();
+        let records: &[[&[u8]; 4]] = fields.as_chunks::<4>().0;
         if records.len() != found.len() {
             bail!("unexpected git check-ignore output");
         }
