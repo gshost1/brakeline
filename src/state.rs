@@ -335,17 +335,36 @@ impl Store {
         id: &str,
         f: impl FnOnce(&mut SessionState) -> Result<R>,
     ) -> Result<R> {
+        match self.update_session(id, f)? {
+            (result, None) => Ok(result),
+            (_, Some(err)) => Err(err),
+        }
+    }
+
+    /// Like `with_session`, but a state that was read yet could not be saved
+    /// (full disk, read-only directory, no lock) still yields `f`'s result,
+    /// with the save error alongside. Errors only when the state is unreadable
+    /// or `f` fails.
+    pub fn update_session<R>(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut SessionState) -> Result<R>,
+    ) -> Result<(R, Option<anyhow::Error>)> {
         let path = self.session_path(id);
-        let _guard = lock(&path.with_extension("lock"))?;
+        // Without the lock, a concurrent call may race us; deciding from the
+        // last saved state is still better than not deciding at all.
+        let guard = lock(&path.with_extension("lock"));
         let mut state = read_state(&path)?.unwrap_or_else(|| SessionState {
             session_id: id.to_string(),
             started_at: now_secs(),
             ..SessionState::default()
         });
         let result = f(&mut state)?;
-        let bytes = serde_json::to_vec_pretty(&state)?;
-        write_atomic(&path, &bytes)?;
-        Ok(result)
+        let saved = guard.and_then(|_guard| {
+            let bytes = serde_json::to_vec_pretty(&state)?;
+            write_atomic(&path, &bytes)
+        });
+        Ok((result, saved.err()))
     }
 
     pub fn load(&self, id: &str) -> Result<Option<SessionState>> {
